@@ -40,13 +40,32 @@ struct ContentView: View {
                     CameraPreview(session: camera.session)
                         .clipShape(RoundedRectangle(cornerRadius: 16))
                     GeometryReader { geo in
-                        Rectangle().fill(.yellow.opacity(0.9)).frame(width: 2)
-                            .position(x: geo.size.width * splitRatio, y: geo.size.height / 2)
+                        // Preview uses resizeAspect: match the portrait video image's fitted bounds.
+                        let videoRatio: CGFloat = 9.0 / 16.0
+                        let previewWidth = min(geo.size.width, geo.size.height * videoRatio)
+                        let previewHeight = previewWidth / videoRatio
+                        let originX = (geo.size.width - previewWidth) / 2
+                        let originY = (geo.size.height - previewHeight) / 2
+                        Path { path in
+                            for page in camera.livePages where page.points.count == 4 {
+                                let points = page.points.map {
+                                    CGPoint(x: originX + $0.x * previewWidth,
+                                            y: originY + $0.y * previewHeight)
+                                }
+                                path.move(to: points[0])
+                                for point in points.dropFirst() { path.addLine(to: point) }
+                                path.closeSubpath()
+                            }
+                        }
+                        .stroke(camera.livePages.count == 2 ? .green : .yellow, lineWidth: 3)
+                        Rectangle().fill(.yellow.opacity(0.55)).frame(width: 1)
+                            .position(x: originX + previewWidth * splitRatio,
+                                      y: geo.size.height / 2)
                     }.allowsHitTesting(false)
                 }
                 .frame(maxHeight: .infinity)
                 .overlay(alignment: .bottom) {
-                    Text("Inquadra due pagine dall'alto")
+                    Text(camera.scanStatus)
                         .font(.caption).padding(8)
                         .foregroundStyle(.white)
                         .background(.black.opacity(0.7), in: Capsule())
@@ -57,6 +76,10 @@ struct ContentView: View {
                     Text("Rilegatura: \(Int(splitRatio * 100))%").font(.caption)
                     Slider(value: $splitRatio, in: 0.30...0.70)
                 }.padding(.horizontal)
+
+                Toggle("Scatto automatico", isOn: $camera.autoEnabled)
+                    .onChange(of: camera.autoEnabled) { _ in camera.resetAutoCapture() }
+                    .padding(.horizontal)
 
                 HStack {
                     Button {
@@ -98,6 +121,10 @@ struct ContentView: View {
             .padding()
             .navigationTitle("BookScan AG 0.4")
             .onAppear {
+                camera.onAutoCapture = {
+                    guard !busy, !reviewing else { return }
+                    camera.capture()
+                }
                 camera.onPhoto = { photo in
                     guard !busy, !reviewing else { return }
                     busy = true
