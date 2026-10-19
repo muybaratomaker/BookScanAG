@@ -1,192 +1,106 @@
 import SwiftUI
 import UIKit
-import Vision
 import CoreImage
 
-// BookScan AG 0.6 — sostituisce ContentView.swift. CameraView.swift resta invariato.
-private struct PageCorners {
-    // Coordinate normalizzate, origine in alto a sinistra.
-    var points: [CGPoint]
-    static let fallback = PageCorners(points: [
-        CGPoint(x: 0.06, y: 0.06), CGPoint(x: 0.94, y: 0.06),
-        CGPoint(x: 0.94, y: 0.94), CGPoint(x: 0.06, y: 0.94)
-    ])
-}
-
-private struct PageDraft: Identifiable {
-    let id = UUID()
-    let image: UIImage
-    var corners: PageCorners
-    let detected: Bool
-    let reliable: Bool
-}
-
+// BookScan AG 0.7 - due aree calibrabili, taglio fisso con margine di sicurezza.
+// Funziona con CameraController e CameraPreview già presenti in CameraView.swift.
 struct ContentView: View {
     @StateObject private var camera = CameraController()
     @State private var pages: [Data] = []
-    @State private var splitRatio = 0.5
-    @State private var pending: [PageDraft] = []
-    @State private var reviewing = false
-    @State private var busy = false
+    @State private var left = CGRect(x: 0.045, y: 0.14, width: 0.445, height: 0.70)
+    @State private var right = CGRect(x: 0.51, y: 0.14, width: 0.445, height: 0.70)
+    @State private var safetyMargin = 0.07
+    @State private var locked = false
+    @State private var processing = false
     @State private var showShare = false
     @State private var exportedURL: URL?
-    @State private var pdfSize: String?
     @State private var errorMessage: String?
+    @State private var pdfSize: String?
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 12) {
-                ZStack {
-                    CameraPreview(session: camera.session)
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
-                    GeometryReader { geo in
-                        // Preview uses resizeAspect: match the portrait video image's fitted bounds.
-                        let videoRatio: CGFloat = 9.0 / 16.0
-                        let previewWidth = min(geo.size.width, geo.size.height * videoRatio)
-                        let previewHeight = previewWidth / videoRatio
-                        let originX = (geo.size.width - previewWidth) / 2
-                        let originY = (geo.size.height - previewHeight) / 2
-                        Path { path in
-                            for page in camera.livePages where page.points.count == 4 {
-                                let points = page.points.map {
-                                    CGPoint(x: originX + $0.x * previewWidth,
-                                            y: originY + $0.y * previewHeight)
-                                }
-                                path.move(to: points[0])
-                                for point in points.dropFirst() { path.addLine(to: point) }
-                                path.closeSubpath()
-                            }
-                        }
-                        .stroke(camera.livePages.count == 2 ? .green : .yellow, lineWidth: 3)
-                        Rectangle().fill(.yellow.opacity(0.55)).frame(width: 1)
-                            .position(x: originX + previewWidth * splitRatio,
-                                      y: geo.size.height / 2)
-                    }.allowsHitTesting(false)
+            VStack(spacing: 9) {
+                // Proporzione 3:4: evita che il ritaglio usi coordinate diverse
+                // dall'anteprima. La fotocamera è usata in verticale.
+                GeometryReader { available in
+                    let displayWidth = min(available.size.width, available.size.height * 3 / 4)
+                    let displayHeight = displayWidth * 4 / 3
+                    ZStack {
+                        CameraPreview(session: camera.session)
+                        CalibrationOverlay(left: $left, right: $right,
+                                           safety: safetyMargin, locked: locked)
+                    }
+                    .frame(width: displayWidth, height: displayHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .frame(width: available.size.width, height: available.size.height)
                 }
                 .frame(maxHeight: .infinity)
-                .overlay(alignment: .bottom) {
-                    Text(camera.scanStatus)
-                        .font(.caption).padding(8)
-                        .foregroundStyle(.white)
-                        .background(.black.opacity(0.7), in: Capsule())
-                        .padding(12)
-                }
-
-                VStack(spacing: 3) {
-                    Text("Rilegatura: \(Int(splitRatio * 100))%").font(.caption)
-                    Slider(value: $splitRatio, in: 0.30...0.70)
-                }.padding(.horizontal)
-
-                Toggle("Scatto automatico (sperimentale)", isOn: $camera.autoEnabled)
-                    .onChange(of: camera.autoEnabled) { _ in camera.resetAutoCapture() }
-                    .padding(.horizontal)
 
                 HStack {
-                    Button {
-                        camera.capture()
-                    } label: {
+                    Label(locked ? "Calibrazione bloccata" : "Trascina bordi e angoli", systemImage: locked ? "lock.fill" : "hand.draw")
+                        .font(.caption)
+                    Spacer()
+                    Button(locked ? "Ricalibra" : "Blocca") { locked.toggle() }
+                        .buttonStyle(.bordered)
+                }
+                HStack {
+                    Text("Margine di sicurezza: \(Int(safetyMargin * 100))%")
+                        .font(.caption)
+                    Slider(value: $safetyMargin, in: 0.03...0.12, step: 0.01)
+                        .disabled(locked)
+                }
+                HStack(spacing: 10) {
+                    Button { camera.capture() } label: {
                         Label("Scatta 2 pagine", systemImage: "camera.fill")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(busy || reviewing || camera.permissionDenied)
+                    .disabled(processing || camera.permissionDenied)
 
-                    Button(busy ? "Attendi…" : "Esporta PDF") { exportPDF() }
+                    Button(processing ? "Attendi…" : "Esporta PDF") { exportPDF() }
                         .buttonStyle(.bordered)
-                        .disabled(busy || pages.isEmpty)
+                        .disabled(processing || pages.isEmpty)
                 }
-
-                Text("Pagine: \(pages.count) · ritaglio sperimentale · JPEG")
+                Text("\(pages.count) pagine salvate · ritaglio fisso · scala di grigi")
                     .font(.caption)
-                if let pdfSize {
-                    Text("Ultimo PDF: \(pdfSize)")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-
+                    .foregroundStyle(.secondary)
+                if let pdfSize { Text("Ultimo PDF: \(pdfSize)").font(.caption) }
                 if !pages.isEmpty {
                     ScrollView(.horizontal) {
-                        HStack(spacing: 8) {
-                            ForEach(pages.indices, id: \.self) { index in
-                                if let image = UIImage(data: pages[index]) {
-                                    Image(uiImage: image)
-                                        .resizable().scaledToFit().frame(height: 95)
+                        HStack(spacing: 6) {
+                            ForEach(pages.indices, id: \.self) { i in
+                                if let img = UIImage(data: pages[i]) {
+                                    Image(uiImage: img).resizable().scaledToFit().frame(height: 68)
                                 }
                             }
                         }
-                    }.frame(height: 105)
+                    }.frame(height: 70)
                     Button("Elimina ultima coppia", role: .destructive) {
                         if pages.count >= 2 { pages.removeLast(2) }
                     }.font(.caption)
                 }
             }
-            .padding()
-            .navigationTitle("BookScan AG 0.6")
+            .padding(10)
+            .navigationTitle("BookScan AG 0.7")
             .onAppear {
-                camera.onAutoCapture = {
-                    guard !busy, !reviewing else { return }
-                    camera.capture()
-                }
-                camera.onPhoto = { photo in
-                    guard !busy, !reviewing else { return }
-                    busy = true
-                    let ratio = splitRatio
+                camera.onPhoto = { image in
+                    guard !processing else { return }
+                    processing = true
+                    let zones = [left, right]
+                    let padding = safetyMargin
                     DispatchQueue.global(qos: .userInitiated).async {
-                        let drafts = ScanProcessor.prepare(photo, ratio: ratio)
+                        let result = FixedCrop.process(image, zones: zones, margin: padding)
                         DispatchQueue.main.async {
-                            busy = false
-                            if drafts.count == 2 {
-                                if drafts.allSatisfy({ $0.reliable }) && camera.autoEnabled {
-                                    // Auto-save only when BOTH page contours pass checks.
-                                    busy = true
-                                    DispatchQueue.global(qos: .userInitiated).async {
-                                        let output = drafts.compactMap {
-                                            ScanProcessor.correctAndCompress($0.image, corners: $0.corners)
-                                        }
-                                        DispatchQueue.main.async {
-                                            busy = false
-                                            if output.count == 2 {
-                                                pages.append(contentsOf: output)
-                                            } else {
-                                                pending = drafts
-                                                reviewing = true
-                                                camera.stop()
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    pending = drafts
-                                    reviewing = true
-                                    camera.stop()
-                                }
-                            } else {
-                                errorMessage = "Non riesco a elaborare questa fotografia."
-                            }
+                            processing = false
+                            if let result { pages.append(contentsOf: result) }
+                            else { errorMessage = "Ritaglio non riuscito. Riprova lo scatto." }
                         }
                     }
                 }
                 camera.start()
             }
             .onDisappear { camera.stop() }
-            .sheet(isPresented: $reviewing, onDismiss: { camera.start() }) {
-                ReviewPagesView(drafts: $pending) { drafts in
-                    reviewing = false
-                    busy = true
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        let output = drafts.compactMap {
-                            ScanProcessor.correctAndCompress($0.image, corners: $0.corners)
-                        }
-                        DispatchQueue.main.async {
-                            busy = false
-                            if output.count == 2 {
-                                pages.append(contentsOf: output)
-                            } else {
-                                errorMessage = "Impossibile salvare entrambe le pagine."
-                            }
-                        }
-                    }
-                }
-            }
             .sheet(isPresented: $showShare) {
-                if let exportedURL { BookScanShareSheet(items: [exportedURL]) }
+                if let exportedURL { BookShareSheet(items: [exportedURL]) }
             }
             .alert("Attenzione", isPresented: Binding(
                 get: { errorMessage != nil },
@@ -205,39 +119,38 @@ struct ContentView: View {
     }
 
     private func exportPDF() {
-        busy = true
-        let snapshot = pages
+        guard !processing else { return }
+        processing = true
+        let data = pages
         DispatchQueue.global(qos: .userInitiated).async {
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("BookScan-\(UUID().uuidString).pdf")
             let bounds = CGRect(x: 0, y: 0, width: 595, height: 842)
-            let renderer = UIGraphicsPDFRenderer(bounds: bounds)
             do {
-                try renderer.writePDF(to: url) { context in
-                    for data in snapshot {
-                        guard let image = UIImage(data: data) else { continue }
-                        context.beginPage()
-                        let area = bounds.insetBy(dx: 15, dy: 15)
-                        let factor = min(area.width / image.size.width,
-                                         area.height / image.size.height)
-                        let size = CGSize(width: image.size.width * factor,
-                                          height: image.size.height * factor)
-                        image.draw(in: CGRect(
-                            x: (bounds.width - size.width) / 2,
-                            y: (bounds.height - size.height) / 2,
-                            width: size.width, height: size.height))
+                try UIGraphicsPDFRenderer(bounds: bounds).writePDF(to: url) { renderer in
+                    for pageData in data {
+                        guard let img = UIImage(data: pageData) else { continue }
+                        renderer.beginPage()
+                        let available = bounds.insetBy(dx: 16, dy: 16)
+                        let scale = min(available.width / img.size.width,
+                                        available.height / img.size.height)
+                        let size = CGSize(width: img.size.width * scale,
+                                          height: img.size.height * scale)
+                        img.draw(in: CGRect(x: (bounds.width - size.width) / 2,
+                                            y: (bounds.height - size.height) / 2,
+                                            width: size.width, height: size.height))
                     }
                 }
                 let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                 DispatchQueue.main.async {
-                    busy = false
+                    processing = false
                     exportedURL = url
                     pdfSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
                     showShare = true
                 }
             } catch {
                 DispatchQueue.main.async {
-                    busy = false
+                    processing = false
                     errorMessage = "Errore PDF: \(error.localizedDescription)"
                 }
             }
@@ -245,192 +158,146 @@ struct ContentView: View {
     }
 }
 
-private struct ReviewPagesView: View {
-    @Binding var drafts: [PageDraft]
-    let onConfirm: ([PageDraft]) -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var selected = 0
+private struct CalibrationOverlay: View {
+    @Binding var left: CGRect
+    @Binding var right: CGRect
+    let safety: Double
+    let locked: Bool
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 12) {
-                Picker("Pagina", selection: $selected) {
-                    Text("Sinistra").tag(0)
-                    Text("Destra").tag(1)
-                }.pickerStyle(.segmented).padding(.horizontal)
-
-                if drafts.indices.contains(selected) {
-                    CornerEditor(image: drafts[selected].image,
-                                 corners: $drafts[selected].corners)
-                        .padding(.horizontal, 12)
-                    Text(drafts[selected].detected
-                         ? "Bordi proposti automaticamente: trascina gli angoli per correggerli."
-                         : "Bordi non rilevati: posiziona manualmente i quattro angoli.")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                }
-                Text("Controlla entrambe le pagine prima di salvare.")
-                    .font(.caption)
-                HStack {
-                    Button("Annulla") { dismiss() }
-                        .buttonStyle(.bordered)
-                    Spacer()
-                    Button("Ripristina angoli") {
-                        if drafts.indices.contains(selected) {
-                            drafts[selected].corners = .fallback
-                        }
-                    }.font(.caption)
-                    Spacer()
-                    Button("Salva 2 pagine") { onConfirm(drafts) }
-                        .buttonStyle(.borderedProminent)
-                }.padding(.horizontal)
-            }
-            .padding(.vertical)
-            .navigationTitle("Controlla il ritaglio")
-            .navigationBarTitleDisplayMode(.inline)
-        }
-    }
-}
-
-private struct CornerEditor: View {
-    let image: UIImage
-    @Binding var corners: PageCorners
-
-    var body: some View {
-        GeometryReader { geometry in
-            let frame = fittedRect(image.size, in: geometry.size)
+        GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                Image(uiImage: image)
-                    .resizable().interpolation(.high)
-                    .frame(width: frame.width, height: frame.height)
-                    .position(x: frame.midX, y: frame.midY)
-
-                Path { path in
-                    guard corners.points.count == 4 else { return }
-                    let pts = corners.points.map {
-                        CGPoint(x: frame.minX + $0.x * frame.width,
-                                y: frame.minY + $0.y * frame.height)
-                    }
-                    path.move(to: pts[0])
-                    for p in pts.dropFirst() { path.addLine(to: p) }
-                    path.closeSubpath()
-                }
-                .stroke(.yellow, style: StrokeStyle(lineWidth: 2, dash: [6, 3]))
-
-                ForEach(0..<4, id: \.self) { index in
-                    Circle()
-                        .fill(.yellow)
-                        .frame(width: 26, height: 26)
-                        .overlay(Circle().stroke(.black, lineWidth: 2))
-                        .position(
-                            x: frame.minX + corners.points[index].x * frame.width,
-                            y: frame.minY + corners.points[index].y * frame.height
-                        )
-                        .modifier(CornerDragModifier(index: index, frame: frame, corners: $corners))
+                outline(left, size: geo.size, color: .green)
+                outline(right, size: geo.size, color: .cyan)
+                if !locked {
+                    editor(rect: $left, size: geo.size, color: .green)
+                    editor(rect: $right, size: geo.size, color: .cyan)
                 }
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
         }
-        .frame(maxHeight: .infinity)
     }
 
-    private func fittedRect(_ image: CGSize, in space: CGSize) -> CGRect {
-        let scale = min(space.width / max(image.width, 1),
-                        space.height / max(image.height, 1))
-        let size = CGSize(width: image.width * scale, height: image.height * scale)
-        return CGRect(x: (space.width-size.width)/2,
-                      y: (space.height-size.height)/2,
-                      width: size.width, height: size.height)
+    @ViewBuilder
+    private func outline(_ rect: CGRect, size: CGSize, color: Color) -> some View {
+        let safe = FixedCrop.expanded(rect, margin: safety)
+        Rectangle()
+            .stroke(color.opacity(0.65), style: StrokeStyle(lineWidth: 2, dash: [5, 4]))
+            .frame(width: safe.width * size.width, height: safe.height * size.height)
+            .position(x: safe.midX * size.width, y: safe.midY * size.height)
+            .allowsHitTesting(false)
+        Rectangle()
+            .stroke(color, lineWidth: 2)
+            .frame(width: rect.width * size.width, height: rect.height * size.height)
+            .position(x: rect.midX * size.width, y: rect.midY * size.height)
+            .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func editor(rect: Binding<CGRect>, size: CGSize, color: Color) -> some View {
+        // Trascina l'interno per spostare il riquadro.
+        Rectangle()
+            .fill(color.opacity(0.08))
+            .frame(width: rect.wrappedValue.width * size.width,
+                   height: rect.wrappedValue.height * size.height)
+            .position(x: rect.wrappedValue.midX * size.width,
+                      y: rect.wrappedValue.midY * size.height)
+            .modifier(ZoneDrag(rect: rect, size: size, corner: nil))
+        // Trascina gli angoli per allargare o restringere.
+        ForEach(0..<4, id: \.self) { corner in
+            let zone = rect.wrappedValue
+            let x = (corner == 0 || corner == 3) ? zone.minX : zone.maxX
+            let y = (corner == 0 || corner == 1) ? zone.minY : zone.maxY
+            Circle()
+                .fill(color)
+                .frame(width: 25, height: 25)
+                .overlay(Circle().stroke(.black, lineWidth: 1.5))
+                .position(x: x * size.width, y: y * size.height)
+                .modifier(ZoneDrag(rect: rect, size: size, corner: corner))
+        }
     }
 }
 
-private struct CornerDragModifier: ViewModifier {
-    let index: Int
-    let frame: CGRect
-    @Binding var corners: PageCorners
-    @State private var start: CGPoint?
+private struct ZoneDrag: ViewModifier {
+    @Binding var rect: CGRect
+    let size: CGSize
+    let corner: Int?
+    @State private var origin: CGRect?
 
     func body(content: Content) -> some View {
-        content.gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    if start == nil { start = corners.points[index] }
-                    guard let origin = start else { return }
-                    corners.points[index] = CGPoint(
-                        x: min(1, max(0, origin.x + value.translation.width / max(1, frame.width))),
-                        y: min(1, max(0, origin.y + value.translation.height / max(1, frame.height)))
-                    )
+        content.gesture(DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if origin == nil { origin = rect }
+                guard let start = origin else { return }
+                let dx = value.translation.width / max(size.width, 1)
+                let dy = value.translation.height / max(size.height, 1)
+                if let corner {
+                    var x1 = start.minX, x2 = start.maxX
+                    var y1 = start.minY, y2 = start.maxY
+                    if corner == 0 || corner == 3 { x1 = min(max(0, x1 + dx), x2 - 0.14) }
+                    else { x2 = max(min(1, x2 + dx), x1 + 0.14) }
+                    if corner == 0 || corner == 1 { y1 = min(max(0, y1 + dy), y2 - 0.15) }
+                    else { y2 = max(min(1, y2 + dy), y1 + 0.15) }
+                    rect = CGRect(x: x1, y: y1, width: x2 - x1, height: y2 - y1)
+                } else {
+                    rect = CGRect(x: min(max(0, start.minX + dx), 1 - start.width),
+                                  y: min(max(0, start.minY + dy), 1 - start.height),
+                                  width: start.width, height: start.height)
                 }
-                .onEnded { _ in start = nil }
-        )
+            }
+            .onEnded { _ in origin = nil })
     }
 }
 
-private enum ScanProcessor {
-    static func prepare(_ photo: UIImage, ratio: Double) -> [PageDraft] {
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        let normalized = UIGraphicsImageRenderer(size: photo.size, format: format)
-            .image { _ in photo.draw(in: CGRect(origin: .zero, size: photo.size)) }
-        guard let cg = normalized.cgImage, cg.width > 4, cg.height > 4 else { return [] }
-        // Analyze the FULL photograph, then crop each page. Never use a
-        // generic rectangle detector or silently include the whole table.
-        guard let detected = BookPageDetector.detect(image: normalized),
-              detected.pages.count == 2 else { return [] }
-        return detected.pages.compactMap { page in
-            let xs = page.points.map(\.x), ys = page.points.map(\.y)
-            guard let l = xs.min(), let r = xs.max(),
-                  let t = ys.min(), let b = ys.max() else { return nil }
-            let rect = CGRect(x: max(0, floor(l * CGFloat(cg.width))),
-                              y: max(0, floor(t * CGFloat(cg.height))),
-                              width: ceil((r-l) * CGFloat(cg.width)),
-                              height: ceil((b-t) * CGFloat(cg.height)))
-                .intersection(CGRect(x:0,y:0,width:cg.width,height:cg.height))
-            guard rect.width > 10, rect.height > 10,
-                  let cropped = cg.cropping(to: rect) else { return nil }
-            return PageDraft(image: UIImage(cgImage: cropped),
-                             corners: PageCorners(points: [CGPoint(x:0,y:0), CGPoint(x:1,y:0), CGPoint(x:1,y:1), CGPoint(x:0,y:1)]),
-                             detected: true,
-                             reliable: true)
-        }
+private enum FixedCrop {
+    static func expanded(_ rect: CGRect, margin: Double) -> CGRect {
+        // Il margine è una percentuale della dimensione della singola zona.
+        let padX = rect.width * margin
+        let padY = rect.height * margin
+        return rect.insetBy(dx: -padX, dy: -padY)
+            .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
     }
 
-    static func correctAndCompress(_ image: UIImage, corners: PageCorners) -> Data? {
-        guard let cg = image.cgImage, corners.points.count == 4 else { return nil }
-        let w = CGFloat(cg.width), h = CGFloat(cg.height)
-        let p = corners.points.map { CGPoint(x: $0.x*w, y: (1-$0.y)*h) }
-        let input = CIImage(cgImage: cg)
-        let filter = CIFilter(name: "CIPerspectiveCorrection")
-        filter?.setValue(input, forKey: kCIInputImageKey)
-        filter?.setValue(CIVector(cgPoint: p[0]), forKey: "inputTopLeft")
-        filter?.setValue(CIVector(cgPoint: p[1]), forKey: "inputTopRight")
-        filter?.setValue(CIVector(cgPoint: p[2]), forKey: "inputBottomRight")
-        filter?.setValue(CIVector(cgPoint: p[3]), forKey: "inputBottomLeft")
-        guard let corrected = filter?.outputImage, !corrected.extent.isEmpty else { return nil }
-        let gray = corrected.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: 0,
-            kCIInputContrastKey: 1.14,
-            kCIInputBrightnessKey: 0.02
-        ])
+    static func process(_ image: UIImage, zones: [CGRect], margin: Double) -> [Data]? {
+        // Normalizzazione dell'orientamento exif prima del ritaglio.
+        let rendererFormat = UIGraphicsImageRendererFormat()
+        rendererFormat.scale = 1
+        let upright = UIGraphicsImageRenderer(size: image.size, format: rendererFormat)
+            .image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
+        guard let cg = upright.cgImage else { return nil }
         let context = CIContext()
-        guard let output = context.createCGImage(gray, from: gray.extent) else { return nil }
-        let source = UIImage(cgImage: output)
-        let scale = min(1, 2000 / max(source.size.width, source.size.height))
-        let size = CGSize(width: max(1, (source.size.width*scale).rounded()),
-                          height: max(1, (source.size.height*scale).rounded()))
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        let resized = UIGraphicsImageRenderer(size: size, format: format)
-            .image { _ in source.draw(in: CGRect(origin: .zero, size: size)) }
-        return resized.jpegData(compressionQuality: 0.76)
+        var result: [Data] = []
+        for zone in zones {
+            let safe = expanded(zone, margin: margin)
+            let box = CGRect(x: safe.minX * CGFloat(cg.width),
+                             y: safe.minY * CGFloat(cg.height),
+                             width: safe.width * CGFloat(cg.width),
+                             height: safe.height * CGFloat(cg.height)).integral
+            guard let crop = cg.cropping(to: box) else { return nil }
+            let original = CIImage(cgImage: crop)
+            let adjusted = original.applyingFilter("CIColorControls", parameters: [
+                kCIInputSaturationKey: 0.0,
+                kCIInputContrastKey: 1.12
+            ])
+            guard let gray = context.createCGImage(adjusted, from: adjusted.extent) else { return nil }
+            let page = UIImage(cgImage: gray)
+            let factor = min(1.0, 2000.0 / max(page.size.width, page.size.height))
+            let outputSize = CGSize(width: max(1, (page.size.width * factor).rounded()),
+                                    height: max(1, (page.size.height * factor).rounded()))
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            let resized = UIGraphicsImageRenderer(size: outputSize, format: format)
+                .image { _ in page.draw(in: CGRect(origin: .zero, size: outputSize)) }
+            guard let data = resized.jpegData(compressionQuality: 0.79) else { return nil }
+            result.append(data)
+        }
+        return result.count == 2 ? result : nil
     }
 }
 
-private struct BookScanShareSheet: UIViewControllerRepresentable {
+private struct BookShareSheet: UIViewControllerRepresentable {
     let items: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
         UIActivityViewController(activityItems: items, applicationActivities: nil)
     }
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
