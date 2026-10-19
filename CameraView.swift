@@ -55,7 +55,7 @@ struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
-        view.previewLayer.videoGravity = .resizeAspectFill
+        view.previewLayer.videoGravity = .resizeAspect
         view.previewLayer.session = session
         return view
     }
