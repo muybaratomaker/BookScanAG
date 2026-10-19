@@ -1,11 +1,13 @@
 import SwiftUI
 import UIKit
 import CoreImage
+import Vision
 
 struct ContentView: View {
     @StateObject private var camera = CameraController()
     @State private var pages: [Data] = [] // JPEG ottimizzati, non fotografie originali
     @State private var splitRatio = 0.5
+    @State private var autoCrop = true
     @State private var showShare = false
     @State private var exportedURL: URL?
     @State private var errorMessage: String?
@@ -35,6 +37,9 @@ struct ContentView: View {
                         .font(.caption)
                     Slider(value: $splitRatio, in: 0.30...0.70)
                 }.padding(.horizontal)
+                Toggle("Ritaglio automatico dei margini", isOn: $autoCrop)
+                    .font(.subheadline)
+                    .padding(.horizontal)
                 HStack(spacing: 16) {
                     Button { camera.capture() } label: {
                         Label("Scatta 2 pagine", systemImage: "camera.fill")
@@ -71,8 +76,9 @@ struct ContentView: View {
             .onAppear {
                 camera.onPhoto = { photo in
                     let ratio = splitRatio
+                    let cropEnabled = autoCrop
                     DispatchQueue.global(qos: .userInitiated).async {
-                        let pair = ImageProcessing.splitAndCompress(photo, ratio: ratio)
+                        let pair = ImageProcessing.splitAndCompress(photo, ratio: ratio, autoCrop: cropEnabled)
                         DispatchQueue.main.async {
                             if let pair { pages.append(contentsOf: pair) }
                             else { errorMessage = "Impossibile elaborare la fotografia." }
@@ -138,7 +144,7 @@ struct ContentView: View {
 private enum ImageProcessing {
     // Obiettivo: immagini leggibili per OCR senza conservare JPEG originali.
     // 1800 px sul lato lungo per singola pagina, JPEG 0.80, scala di grigi.
-    static func splitAndCompress(_ image: UIImage, ratio: Double) -> [Data]? {
+    static func splitAndCompress(_ image: UIImage, ratio: Double, autoCrop: Bool) -> [Data]? {
         let normalizedFormat = UIGraphicsImageRendererFormat()
         normalizedFormat.scale = 1
         let normalized = UIGraphicsImageRenderer(size: image.size, format: normalizedFormat)
@@ -151,7 +157,8 @@ private enum ImageProcessing {
         var result: [Data] = []
         for rect in rects {
             guard let cropped = cg.cropping(to: rect) else { return nil }
-            let source = CIImage(cgImage: cropped)
+            let detected = autoCrop ? detectPage(in: cropped) : nil
+            let source = CIImage(cgImage: detected ?? cropped)
             let gray = source.applyingFilter("CIColorControls", parameters: [
                 kCIInputSaturationKey: 0.0,
                 kCIInputContrastKey: 1.12
@@ -169,6 +176,46 @@ private enum ImageProcessing {
             result.append(jpeg)
         }
         return result
+    }
+
+    // Rileva un rettangolo con Vision. Se la confidenza geometrica è bassa,
+    // conserva l'immagine originale per non perdere righe di testo.
+    private static func detectPage(in image: CGImage) -> CGImage? {
+        let request = VNDetectRectanglesRequest()
+        request.maximumObservations = 8
+        request.minimumConfidence = 0.65
+        request.minimumSize = 0.25
+        request.minimumAspectRatio = 0.25
+        request.maximumAspectRatio = 1.0
+        request.quadratureTolerance = 25
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        do { try handler.perform([request]) } catch { return nil }
+        guard let rectangles = request.results, !rectangles.isEmpty else { return nil }
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let candidates = rectangles.compactMap { observation -> CGRect? in
+            let box = observation.boundingBox
+            // VN usa coordinate normalizzate con origine in basso a sinistra.
+            let raw = CGRect(x: box.minX * width,
+                             y: (1 - box.maxY) * height,
+                             width: box.width * width,
+                             height: box.height * height)
+            let fraction = (raw.width * raw.height) / (width * height)
+            guard fraction >= 0.48, fraction <= 0.99,
+                  raw.width > width * 0.55,
+                  raw.height > height * 0.55 else { return nil }
+            return raw
+        }
+        guard let largest = candidates.max(by: { $0.width * $0.height < $1.width * $1.height }) else {
+            return nil
+        }
+        // Margine di sicurezza: 2% per non tagliare numeri e intestazioni.
+        let paddingX = width * 0.02
+        let paddingY = height * 0.02
+        let safe = largest.insetBy(dx: -paddingX, dy: -paddingY)
+            .intersection(CGRect(x: 0, y: 0, width: width, height: height)).integral
+        guard !safe.isEmpty else { return nil }
+        return image.cropping(to: safe)
     }
 }
 
