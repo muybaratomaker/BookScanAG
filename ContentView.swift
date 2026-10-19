@@ -3,7 +3,7 @@ import UIKit
 import Vision
 import CoreImage
 
-// BookScan AG 0.4 — sostituisce ContentView.swift. CameraView.swift resta invariato.
+// BookScan AG 0.6 — sostituisce ContentView.swift. CameraView.swift resta invariato.
 private struct PageCorners {
     // Coordinate normalizzate, origine in alto a sinistra.
     var points: [CGPoint]
@@ -77,7 +77,7 @@ struct ContentView: View {
                     Slider(value: $splitRatio, in: 0.30...0.70)
                 }.padding(.horizontal)
 
-                Toggle("Scatto automatico", isOn: $camera.autoEnabled)
+                Toggle("Scatto automatico (sperimentale)", isOn: $camera.autoEnabled)
                     .onChange(of: camera.autoEnabled) { _ in camera.resetAutoCapture() }
                     .padding(.horizontal)
 
@@ -95,7 +95,7 @@ struct ContentView: View {
                         .disabled(busy || pages.isEmpty)
                 }
 
-                Text("Pagine: \(pages.count) · correzione prospettica · JPEG")
+                Text("Pagine: \(pages.count) · ritaglio sperimentale · JPEG")
                     .font(.caption)
                 if let pdfSize {
                     Text("Ultimo PDF: \(pdfSize)")
@@ -119,7 +119,7 @@ struct ContentView: View {
                 }
             }
             .padding()
-            .navigationTitle("BookScan AG 0.4")
+            .navigationTitle("BookScan AG 0.6")
             .onAppear {
                 camera.onAutoCapture = {
                     guard !busy, !reviewing else { return }
@@ -134,7 +134,7 @@ struct ContentView: View {
                         DispatchQueue.main.async {
                             busy = false
                             if drafts.count == 2 {
-                                if drafts.allSatisfy({ $0.reliable }) {
+                                if drafts.allSatisfy({ $0.reliable }) && camera.autoEnabled {
                                     // Auto-save only when BOTH page contours pass checks.
                                     busy = true
                                     DispatchQueue.global(qos: .userInitiated).async {
@@ -373,88 +373,27 @@ private enum ScanProcessor {
         format.scale = 1
         let normalized = UIGraphicsImageRenderer(size: photo.size, format: format)
             .image { _ in photo.draw(in: CGRect(origin: .zero, size: photo.size)) }
-        guard let cg = normalized.cgImage, cg.width > 4 else { return [] }
-        let split = max(1, min(cg.width-1, Int(CGFloat(cg.width)*CGFloat(ratio))))
-        let halves = [
-            CGRect(x: 0, y: 0, width: split, height: cg.height),
-            CGRect(x: split, y: 0, width: cg.width-split, height: cg.height)
-        ]
-        return halves.compactMap { rect in
-            guard let half = cg.cropping(to: rect) else { return nil }
-            let detection = detect(half)
-            return PageDraft(image: UIImage(cgImage: half),
-                             corners: detection?.0 ?? .fallback,
-                             detected: detection != nil,
-                             reliable: detection?.1 ?? false)
+        guard let cg = normalized.cgImage, cg.width > 4, cg.height > 4 else { return [] }
+        // Analyze the FULL photograph, then crop each page. Never use a
+        // generic rectangle detector or silently include the whole table.
+        guard let detected = BookPageDetector.detect(image: normalized),
+              detected.pages.count == 2 else { return [] }
+        return detected.pages.compactMap { page in
+            let xs = page.points.map(\.x), ys = page.points.map(\.y)
+            guard let l = xs.min(), let r = xs.max(),
+                  let t = ys.min(), let b = ys.max() else { return nil }
+            let rect = CGRect(x: max(0, floor(l * CGFloat(cg.width))),
+                              y: max(0, floor(t * CGFloat(cg.height))),
+                              width: ceil((r-l) * CGFloat(cg.width)),
+                              height: ceil((b-t) * CGFloat(cg.height)))
+                .intersection(CGRect(x:0,y:0,width:cg.width,height:cg.height))
+            guard rect.width > 10, rect.height > 10,
+                  let cropped = cg.cropping(to: rect) else { return nil }
+            return PageDraft(image: UIImage(cgImage: cropped),
+                             corners: PageCorners(points: [CGPoint(x:0,y:0), CGPoint(x:1,y:0), CGPoint(x:1,y:1), CGPoint(x:0,y:1)]),
+                             detected: true,
+                             reliable: true)
         }
-    }
-
-    // Conservative page detector: Vision rectangle geometry + text evidence.
-    // Never silently substitute the whole photograph when a contour is uncertain.
-    private static func detect(_ image: CGImage) -> (PageCorners, Bool)? {
-        let rectangleRequest = VNDetectRectanglesRequest()
-        rectangleRequest.maximumObservations = 16
-        rectangleRequest.minimumConfidence = 0.35
-        rectangleRequest.minimumSize = 0.12
-        rectangleRequest.minimumAspectRatio = 0.15
-        rectangleRequest.maximumAspectRatio = 1.0
-        rectangleRequest.quadratureTolerance = 40
-
-        let textRequest = VNRecognizeTextRequest()
-        textRequest.recognitionLevel = .fast
-        textRequest.usesLanguageCorrection = false
-
-        do {
-            try VNImageRequestHandler(cgImage: image, options: [:])
-                .perform([rectangleRequest, textRequest])
-        } catch { return nil }
-
-        let texts = textRequest.results ?? []
-        let candidates = (rectangleRequest.results ?? []).compactMap { rectangle
-            -> (VNRectangleObservation, Double, Bool)? in
-            let box = rectangle.boundingBox
-            let area = Double(box.width * box.height)
-            // A book page should fill a substantial part of its half-frame.
-            guard area >= 0.28, box.width >= 0.48, box.height >= 0.46 else {
-                return nil
-            }
-            // Reject short, wide regions likely to be keyboards or desks.
-            let ratio = box.height / max(box.width, 0.001)
-            guard ratio > 0.65 else { return nil }
-
-            let matchingText = texts.filter { text in
-                let center = CGPoint(x: text.boundingBox.midX, y: text.boundingBox.midY)
-                return box.contains(center)
-            }
-            // Text must be spread across the page, not clustered on a keyboard.
-            let verticalSpread: CGFloat = {
-                guard let minY = matchingText.map({ $0.boundingBox.midY }).min(),
-                      let maxY = matchingText.map({ $0.boundingBox.midY }).max()
-                else { return 0 }
-                return (maxY - minY) / max(box.height, 0.001)
-            }()
-            let hasPageText = matchingText.count >= 5 && verticalSpread >= 0.18
-            let centrality = max(0, 1 - abs(Double(box.midX) - 0.5) * 2)
-            let score = area * 2.0 + Double(rectangle.confidence) * 0.5
-                        + (hasPageText ? 0.5 : 0)
-                        + centrality * 0.15
-            let reliable = area >= 0.42 &&
-                           rectangle.confidence >= 0.65 &&
-                           hasPageText && centrality >= 0.45
-            return (rectangle, score, reliable)
-        }
-        guard let best = candidates.max(by: { $0.1 < $1.1 }) else {
-            return nil
-        }
-
-        func flip(_ p: CGPoint) -> CGPoint {
-            CGPoint(x: p.x, y: 1-p.y)
-        }
-        let r = best.0
-        return (PageCorners(points: [
-            flip(r.topLeft), flip(r.topRight),
-            flip(r.bottomRight), flip(r.bottomLeft)
-        ]), best.2)
     }
 
     static func correctAndCompress(_ image: UIImage, corners: PageCorners) -> Data? {

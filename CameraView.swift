@@ -1,7 +1,7 @@
 import SwiftUI
 import AVFoundation
 import UIKit
-import Vision
+import CoreImage
 
 struct LivePage: Equatable {
     // Points are normalized in top-left image coordinates, clockwise.
@@ -17,7 +17,7 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
     @Published var permissionDenied = false
     @Published var livePages: [LivePage] = []
     @Published var scanStatus = "Inquadra il libro aperto"
-    @Published var autoEnabled = true
+    @Published var autoEnabled = false
     var onPhoto: ((UIImage) -> Void)?
     var onAutoCapture: (() -> Void)?
 
@@ -96,50 +96,38 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
         lastVisionTime = now
         processingFrame = true
         defer { processingFrame = false }
-        let request = VNDetectRectanglesRequest()
-        request.maximumObservations = 14
-        request.minimumConfidence = 0.50
-        request.minimumSize = 0.13
-        request.minimumAspectRatio = 0.15
-        request.quadratureTolerance = 35
-        do {
-            // Video buffers are portrait because the video connection is portrait.
-            try VNImageRequestHandler(cvPixelBuffer: pixel, orientation: .up, options: [:]).perform([request])
-        } catch { return }
-        let observations = (request.results ?? []).filter {
-            let b = $0.boundingBox
-            return b.width > 0.20 && b.height > 0.25 && b.width * b.height > 0.095
+        // Segment bright paper regions instead of searching for rectangles.
+        let result = BookPageDetector.detect(pixelBuffer: pixel)
+        let selected = result?.pages ?? []
+        let boxes = selected.map { page -> CGRect in
+            let xs = page.points.map(\.x), ys = page.points.map(\.y)
+            return CGRect(x: xs.min() ?? 0, y: ys.min() ?? 0,
+                          width: (xs.max() ?? 0) - (xs.min() ?? 0),
+                          height: (ys.max() ?? 0) - (ys.min() ?? 0))
         }
-        // Split the live frame around the book's central binding.
-        let left = observations.filter { $0.boundingBox.midX < 0.5 }
-            .max(by: { $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height })
-        let right = observations.filter { $0.boundingBox.midX >= 0.5 }
-            .max(by: { $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height })
-        let selected = [left, right].compactMap { $0 }
-        let boxes = selected.map(\.boundingBox)
-        let stable = selected.count == 2 && previousBoxes.count == 2 && zip(boxes, previousBoxes).allSatisfy {
-            let a = $0.0, b = $0.1
-            return abs(a.midX-b.midX) < 0.022 && abs(a.midY-b.midY) < 0.022 &&
-                   abs(a.width-b.width) < 0.025 && abs(a.height-b.height) < 0.025
-        }
+        let stable = boxes.count == 2 && previousBoxes.count == 2 &&
+            zip(boxes, previousBoxes).allSatisf {
+                abs($0.0.midX - $0.1.midX) < 0.016 &&
+                abs($0.0.midY - $0.1.midY) < 0.016 &&
+                abs($0.0.width - $0.1.width) < 0.020 &&
+                abs($0.0.height - $0.1.height) < 0.020
+            }
         stableFrames = stable ? stableFrames + 1 : 0
         previousBoxes = boxes
-        if selected.count < 2 {
-            absentFrames += 1
-        } else { absentFrames = 0 }
-        // Require the book to disappear/change clearly before the next automatic capture.
-        if waitingForTurn && absentFrames >= 3 { waitingForTurn = false; stableFrames = 0 }
-        let contours = selected.map { observation -> LivePage in
-            func convert(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x, y: 1 - p.y) }
-            return LivePage(points: [convert(observation.topLeft), convert(observation.topRight),
-                                     convert(observation.bottomRight), convert(observation.bottomLeft)])
+        if boxes.count < 2 { absentFrames += 1 } else { absentFrames = 0 }
+        if waitingForTurn && absentFrames >= 5 {
+            waitingForTurn = false
+            stableFrames = 0
         }
-        let shouldCapture = stableFrames >= 5 && !waitingForTurn && selected.count == 2 && autoEnabled
+        // Intentionally conservative: automatic capture can be enabled by the user.
+        let shouldCapture = stableFrames >= 7 && !waitingForTurn &&
+                            selected.count == 2 && autoEnabled
         if shouldCapture { waitingForTurn = true; stableFrames = 0 }
         DispatchQueue.main.async {
-            self.livePages = contours
-            self.scanStatus = self.waitingForTurn && !shouldCapture ? "Gira pagina per continuare" :
-                selected.count == 2 ? (stable ? "Tieni fermo…" : "Allinea le pagine") : "Cerco due pagine…"
+            self.livePages = selected
+            self.scanStatus = selected.count == 2
+                ? (stable ? "Libro individuato · tieni fermo" : "Contorni in verifica…")
+                : "Cerco le superfici delle pagine…"
             if shouldCapture && self.autoEnabled { self.onAutoCapture?() }
         }
     }
