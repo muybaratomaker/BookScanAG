@@ -105,13 +105,29 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
                           width: (xs.max() ?? 0) - (xs.min() ?? 0),
                           height: (ys.max() ?? 0) - (ys.min() ?? 0))
         }
-        let stable = boxes.count == 2 && previousBoxes.count == 2 &&
-            zip(boxes, previousBoxes).allSatisf {
-                abs($0.0.midX - $0.1.midX) < 0.016 &&
-                abs($0.0.midY - $0.1.midY) < 0.016 &&
-                abs($0.0.width - $0.1.width) < 0.020 &&
-                abs($0.0.height - $0.1.height) < 0.020
-            }
+var stable = false
+
+if boxes.count == 2 && previousBoxes.count == 2 {
+    stable = true
+
+    for index in 0..<2 {
+        let current = boxes[index]
+        let previous = previousBoxes[index]
+
+        let dx = abs(current.midX - previous.midX)
+        let dy = abs(current.midY - previous.midY)
+        let dw = abs(current.width - previous.width)
+        let dh = abs(current.height - previous.height)
+
+        if dx >= 0.016 ||
+           dy >= 0.016 ||
+           dw >= 0.020 ||
+           dh >= 0.020 {
+            stable = false
+            break
+        }
+    }
+}
         stableFrames = stable ? stableFrames + 1 : 0
         previousBoxes = boxes
         if boxes.count < 2 { absentFrames += 1 } else { absentFrames = 0 }
