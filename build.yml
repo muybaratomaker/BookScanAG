@@ -1,0 +1,26 @@
+name: Build iOS IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build for iPhone (unsigned)
+        run: |
+          xcodebuild -project BookScanAG.xcodeproj -scheme BookScanAG -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/BookScanAG.app Payload/
+          zip -qr BookScanAG-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BookScanAG-unsigned
+          path: BookScanAG-unsigned.ipa
