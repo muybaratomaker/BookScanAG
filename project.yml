@@ -10,7 +10,10 @@ targets:
   BookScanAG:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources:
+  - path: .
+    includes:
+      - "*.swift"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.bookscanag.reader
