@@ -2,13 +2,12 @@ import SwiftUI
 import UIKit
 import CoreImage
 
-// BookScan AG 0.7 - due aree calibrabili, taglio fisso con margine di sicurezza.
+// BookScan AG 0.8 - pagina singola, ritaglio regolabile, PDF Bilanciato.
 // Funziona con CameraController e CameraPreview già presenti in CameraView.swift.
 struct ContentView: View {
     @StateObject private var camera = CameraController()
     @State private var pages: [Data] = []
-    @State private var left = CGRect(x: 0.045, y: 0.14, width: 0.445, height: 0.70)
-    @State private var right = CGRect(x: 0.51, y: 0.14, width: 0.445, height: 0.70)
+    @State private var pageZone = CGRect(x: 0.075, y: 0.10, width: 0.85, height: 0.80)
     @State private var safetyMargin = 0.07
     @State private var locked = false
     @State private var processing = false
@@ -27,7 +26,7 @@ struct ContentView: View {
                     let displayHeight = displayWidth * 4 / 3
                     ZStack {
                         CameraPreview(session: camera.session)
-                        CalibrationOverlay(left: $left, right: $right,
+                        CalibrationOverlay(zone: $pageZone,
                                            safety: safetyMargin, locked: locked)
                     }
                     .frame(width: displayWidth, height: displayHeight)
@@ -50,8 +49,12 @@ struct ContentView: View {
                         .disabled(locked)
                 }
                 HStack(spacing: 10) {
-                    Button { camera.capture() } label: {
-                        Label("Scatta 2 pagine", systemImage: "camera.fill")
+                    Button {
+                        guard !processing else { return }
+                        processing = true
+                        camera.capture()
+                    } label: {
+                        Label("Scatta pagina", systemImage: "camera.fill")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(processing || camera.permissionDenied)
@@ -60,7 +63,7 @@ struct ContentView: View {
                         .buttonStyle(.bordered)
                         .disabled(processing || pages.isEmpty)
                 }
-                Text("\(pages.count) pagine salvate · ritaglio fisso · scala di grigi")
+                Text("\(pages.count) pagine · Bilanciato: 1700 px / JPEG 68%")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let pdfSize { Text("Ultimo PDF: \(pdfSize)").font(.caption) }
@@ -74,24 +77,22 @@ struct ContentView: View {
                             }
                         }
                     }.frame(height: 70)
-                    Button("Elimina ultima coppia", role: .destructive) {
-                        if pages.count >= 2 { pages.removeLast(2) }
+                    Button("Elimina ultima pagina", role: .destructive) {
+                        if !pages.isEmpty { pages.removeLast() }
                     }.font(.caption)
                 }
             }
             .padding(10)
-            .navigationTitle("BookScan AG 0.7")
+            .navigationTitle("BookScan AG 0.8")
             .onAppear {
                 camera.onPhoto = { image in
-                    guard !processing else { return }
-                    processing = true
-                    let zones = [left, right]
+                    let zone = pageZone
                     let padding = safetyMargin
                     DispatchQueue.global(qos: .userInitiated).async {
-                        let result = FixedCrop.process(image, zones: zones, margin: padding)
+                        let result = FixedCrop.process(image, zone: zone, margin: padding)
                         DispatchQueue.main.async {
                             processing = false
-                            if let result { pages.append(contentsOf: result) }
+                            if let result { pages.append(result) }
                             else { errorMessage = "Ritaglio non riuscito. Riprova lo scatto." }
                         }
                     }
@@ -159,19 +160,16 @@ struct ContentView: View {
 }
 
 private struct CalibrationOverlay: View {
-    @Binding var left: CGRect
-    @Binding var right: CGRect
+    @Binding var zone: CGRect
     let safety: Double
     let locked: Bool
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
-                outline(left, size: geo.size, color: .green)
-                outline(right, size: geo.size, color: .cyan)
+                outline(zone, size: geo.size, color: .green)
                 if !locked {
-                    editor(rect: $left, size: geo.size, color: .green)
-                    editor(rect: $right, size: geo.size, color: .cyan)
+                    editor(rect: $zone, size: geo.size, color: .green)
                 }
             }
         }
@@ -257,41 +255,43 @@ private enum FixedCrop {
             .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
     }
 
-    static func process(_ image: UIImage, zones: [CGRect], margin: Double) -> [Data]? {
-        // Normalizzazione dell'orientamento exif prima del ritaglio.
-        let rendererFormat = UIGraphicsImageRendererFormat()
-        rendererFormat.scale = 1
-        let upright = UIGraphicsImageRenderer(size: image.size, format: rendererFormat)
+    static func process(_ image: UIImage, zone: CGRect, margin: Double) -> Data? {
+        // Normalize UIImage orientation (portrait EXIF) before cropping.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let upright = UIGraphicsImageRenderer(size: image.size, format: format)
             .image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
         guard let cg = upright.cgImage else { return nil }
+
+        let safe = expanded(zone, margin: margin)
+        let bounds = CGRect(x: safe.minX * CGFloat(cg.width),
+                            y: safe.minY * CGFloat(cg.height),
+                            width: safe.width * CGFloat(cg.width),
+                            height: safe.height * CGFloat(cg.height)).integral
+            .intersection(CGRect(x: 0, y: 0, width: CGFloat(cg.width), height: CGFloat(cg.height)))
+        guard !bounds.isEmpty, let cropped = cg.cropping(to: bounds) else { return nil }
+
+        // OCR-oriented grayscale; avoid extreme contrast that could erase faint characters.
+        let input = CIImage(cgImage: cropped)
+        let adjusted = input.applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0.0,
+            kCIInputContrastKey: 1.09,
+            kCIInputBrightnessKey: 0.01
+        ])
         let context = CIContext()
-        var result: [Data] = []
-        for zone in zones {
-            let safe = expanded(zone, margin: margin)
-            let box = CGRect(x: safe.minX * CGFloat(cg.width),
-                             y: safe.minY * CGFloat(cg.height),
-                             width: safe.width * CGFloat(cg.width),
-                             height: safe.height * CGFloat(cg.height)).integral
-            guard let crop = cg.cropping(to: box) else { return nil }
-            let original = CIImage(cgImage: crop)
-            let adjusted = original.applyingFilter("CIColorControls", parameters: [
-                kCIInputSaturationKey: 0.0,
-                kCIInputContrastKey: 1.12
-            ])
-            guard let gray = context.createCGImage(adjusted, from: adjusted.extent) else { return nil }
-            let page = UIImage(cgImage: gray)
-            let factor = min(1.0, 2000.0 / max(page.size.width, page.size.height))
-            let outputSize = CGSize(width: max(1, (page.size.width * factor).rounded()),
-                                    height: max(1, (page.size.height * factor).rounded()))
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 1
-            let resized = UIGraphicsImageRenderer(size: outputSize, format: format)
-                .image { _ in page.draw(in: CGRect(origin: .zero, size: outputSize)) }
-            guard let data = resized.jpegData(compressionQuality: 0.79) else { return nil }
-            result.append(data)
+        guard let output = context.createCGImage(adjusted, from: adjusted.extent) else { return nil }
+        let page = UIImage(cgImage: output)
+        let scale = min(1, 1700 / max(page.size.width, page.size.height))
+        let target = CGSize(width: max(1, (page.size.width * scale).rounded()),
+                            height: max(1, (page.size.height * scale).rounded()))
+        let smallFormat = UIGraphicsImageRendererFormat()
+        smallFormat.scale = 1
+        let resized = UIGraphicsImageRenderer(size: target, format: smallFormat).image { _ in
+            page.draw(in: CGRect(origin: .zero, size: target))
         }
-        return result.count == 2 ? result : nil
+        return resized.jpegData(compressionQuality: 0.68)
     }
+
 }
 
 private struct BookShareSheet: UIViewControllerRepresentable {
