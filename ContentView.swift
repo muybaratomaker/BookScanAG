@@ -2,13 +2,14 @@ import SwiftUI
 import UIKit
 import CoreImage
 
-// BookScan AG 0.8 - pagina singola, ritaglio regolabile, PDF Bilanciato.
+// BookScan AG 0.9 - pagina singola, profili Documento e Alta leggibilita.
 // Funziona con CameraController e CameraPreview già presenti in CameraView.swift.
 struct ContentView: View {
     @StateObject private var camera = CameraController()
     @State private var pages: [Data] = []
     @State private var pageZone = CGRect(x: 0.075, y: 0.10, width: 0.85, height: 0.80)
     @State private var safetyMargin = 0.07
+    @State private var documentProfile: DocumentProfile = .compact
     @State private var locked = false
     @State private var processing = false
     @State private var showShare = false
@@ -63,8 +64,18 @@ struct ContentView: View {
                         .buttonStyle(.bordered)
                         .disabled(processing || pages.isEmpty)
                 }
-                Text("\(pages.count) pagine · Bilanciato: 1700 px / JPEG 68%")
+                Picker("Qualità", selection: $documentProfile) {
+                    ForEach(DocumentProfile.allCases) { profile in
+                        Text(profile.title).tag(profile)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(!pages.isEmpty || processing)
+                Text("\(pages.count) pagine · \(documentProfile.longEdge) px / JPEG \(Int(documentProfile.jpegQuality * 100))%")
                     .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(pages.isEmpty ? "Scegli un profilo prima di iniziare." : "Per cambiare profilo, esporta e inizia una nuova scansione.")
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
                 if let pdfSize { Text("Ultimo PDF: \(pdfSize)").font(.caption) }
                 if !pages.isEmpty {
@@ -83,13 +94,14 @@ struct ContentView: View {
                 }
             }
             .padding(10)
-            .navigationTitle("BookScan AG 0.8")
+            .navigationTitle("BookScan AG 0.9")
             .onAppear {
                 camera.onPhoto = { image in
                     let zone = pageZone
                     let padding = safetyMargin
+                    let profile = documentProfile
                     DispatchQueue.global(qos: .userInitiated).async {
-                        let result = FixedCrop.process(image, zone: zone, margin: padding)
+                        let result = FixedCrop.process(image, zone: zone, margin: padding, profile: profile)
                         DispatchQueue.main.async {
                             processing = false
                             if let result { pages.append(result) }
@@ -246,6 +258,24 @@ private struct ZoneDrag: ViewModifier {
     }
 }
 
+// Choose a profile before taking the first picture.
+// Values are starting points, not guaranteed target PDF sizes.
+private enum DocumentProfile: String, CaseIterable, Identifiable {
+    case compact
+    case readable
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .compact: return "Documento leggero"
+        case .readable: return "Testo piccolo"
+        }
+    }
+    var longEdge: Int { self == .compact ? 1500 : 1700 }
+    var jpegQuality: CGFloat { self == .compact ? 0.54 : 0.68 }
+    var contrast: CGFloat { self == .compact ? 1.14 : 1.09 }
+    var brightness: CGFloat { self == .compact ? 0.025 : 0.01 }
+}
+
 private enum FixedCrop {
     static func expanded(_ rect: CGRect, margin: Double) -> CGRect {
         // Il margine è una percentuale della dimensione della singola zona.
@@ -255,7 +285,7 @@ private enum FixedCrop {
             .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
     }
 
-    static func process(_ image: UIImage, zone: CGRect, margin: Double) -> Data? {
+    static func process(_ image: UIImage, zone: CGRect, margin: Double, profile: DocumentProfile) -> Data? {
         // Normalize UIImage orientation (portrait EXIF) before cropping.
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
@@ -271,17 +301,18 @@ private enum FixedCrop {
             .intersection(CGRect(x: 0, y: 0, width: CGFloat(cg.width), height: CGFloat(cg.height)))
         guard !bounds.isEmpty, let cropped = cg.cropping(to: bounds) else { return nil }
 
-        // OCR-oriented grayscale; avoid extreme contrast that could erase faint characters.
+        // Grayscale, gentle document enhancement. No binary threshold:
+        // faint letters and text near the book gutter must remain visible.
         let input = CIImage(cgImage: cropped)
         let adjusted = input.applyingFilter("CIColorControls", parameters: [
             kCIInputSaturationKey: 0.0,
-            kCIInputContrastKey: 1.09,
-            kCIInputBrightnessKey: 0.01
+            kCIInputContrastKey: profile.contrast,
+            kCIInputBrightnessKey: profile.brightness
         ])
         let context = CIContext()
         guard let output = context.createCGImage(adjusted, from: adjusted.extent) else { return nil }
         let page = UIImage(cgImage: output)
-        let scale = min(1, 1700 / max(page.size.width, page.size.height))
+        let scale = min(1, CGFloat(profile.longEdge) / max(page.size.width, page.size.height))
         let target = CGSize(width: max(1, (page.size.width * scale).rounded()),
                             height: max(1, (page.size.height * scale).rounded()))
         let smallFormat = UIGraphicsImageRendererFormat()
@@ -289,7 +320,7 @@ private enum FixedCrop {
         let resized = UIGraphicsImageRenderer(size: target, format: smallFormat).image { _ in
             page.draw(in: CGRect(origin: .zero, size: target))
         }
-        return resized.jpegData(compressionQuality: 0.68)
+        return resized.jpegData(compressionQuality: profile.jpegQuality)
     }
 
 }
