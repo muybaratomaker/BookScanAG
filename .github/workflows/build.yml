@@ -8,6 +8,31 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare iOS app icon from ICO
+        run: |
+          python3 -m pip install --user Pillow
+          python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          import json
+
+          source = Path('bookscanag_favicon.ico')
+          if not source.is_file():
+              raise SystemExit('Missing bookscanag_favicon.ico in repository root')
+          dest = Path('Assets.xcassets/AppIcon.appiconset')
+          dest.mkdir(parents=True, exist_ok=True)
+          image = Image.open(source).convert('RGBA')
+          image = image.resize((1024, 1024), Image.Resampling.LANCZOS)
+          # The iOS app icon must have no alpha channel.
+          background = Image.new('RGB', image.size, (255, 255, 255))
+          background.paste(image, mask=image.getchannel('A'))
+          background.save(dest / 'AppIcon.png', optimize=True)
+          (dest / 'Contents.json').write_text(json.dumps({
+              'images': [{'filename': 'AppIcon.png', 'idiom': 'universal',
+                          'platform': 'ios', 'size': '1024x1024'}],
+              'info': {'author': 'xcode', 'version': 1}
+          }, indent=2))
+          PY
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
