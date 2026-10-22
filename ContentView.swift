@@ -3,7 +3,7 @@ import UIKit
 import CoreImage
 import AudioToolbox
 
-// BookScan AG 1.0: home Apple Minimal, single-page scan, reusable crop and document looks.
+// BookScan AG 1.1: floating Apple Minimal redesign, single-page scan, reusable crop and document looks.
 // Compatible with existing CameraView.swift (CameraController / CameraPreview).
 struct ContentView: View {
     @StateObject private var camera = CameraController()
@@ -56,142 +56,221 @@ struct ContentView: View {
         .tint(.blue)
     }
 
+    // MARK: - BookScan AG 1.1: softer home, edge-to-edge scanner, floating controls.
     private var homeScreen: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("IL TUO SCANNER").font(.caption.weight(.semibold))
-                            .tracking(1.5).foregroundStyle(.secondary)
-                        Text("BookScan AG").font(.largeTitle.bold())
-                        Text("Libri in PDF, senza complicazioni")
-                            .font(.subheadline).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button { showControls = true } label: {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.title3).frame(width: 44, height: 44)
-                            .background(.white, in: Circle())
-                    }.accessibilityLabel("Impostazioni scansione")
-                }
-                VStack(alignment: .leading, spacing: 18) {
-                    Label("Nuova scansione", systemImage: "doc.viewfinder")
-                        .font(.title2.bold())
-                    Text("Una pagina alla volta. Calibra il riquadro e continua a scattare.")
-                        .font(.subheadline).foregroundStyle(.secondary)
+        ZStack {
+            Color(uiColor: .systemBackground).ignoresSafeArea()
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
                     HStack {
-                        Image(systemName: "doc.text.image").foregroundStyle(.blue)
-                        Text(documentProfile.title)
+                        Label("BOOKSCAN", systemImage: "book.pages")
+                            .font(.caption.weight(.bold)).tracking(2.1)
+                            .foregroundStyle(Color(red: 0.28, green: 0.34, blue: 0.46))
                         Spacer()
-                        Text(scanStyle.title).foregroundStyle(.secondary)
-                    }.font(.subheadline)
-                        .padding(13)
-                        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
-                    Button { scanning = true } label: {
-                        Label(originals.isEmpty ? "Inizia scansione" : "Continua scansione", systemImage: "camera.fill")
-                            .font(.headline).frame(maxWidth: .infinity).frame(height: 54)
-                    }.buttonStyle(.borderedProminent).controlSize(.large)
-                }.padding(20).background(.white, in: RoundedRectangle(cornerRadius: 22))
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("Sessione corrente").font(.title3.bold())
+                        Button { showControls = true } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.system(size: 19, weight: .medium))
+                                .foregroundStyle(.primary)
+                                .frame(width: 50, height: 50)
+                                .background(Color(uiColor: .secondarySystemBackground), in: Circle())
+                        }
+                        .accessibilityLabel("Impostazioni scansione")
+                    }
+                    .padding(.top, 18)
+
+                    Text("Il tuo libro,\nuna pagina alla volta.")
+                        .font(.system(size: 38, weight: .bold, design: .rounded))
+                        .tracking(-1.5)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 40)
+                    Text("Scatta, ritaglia ed esporta un PDF leggero.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 12)
+
+                    // Decorative illustration, no fake documents or additional actions.
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 34, style: .continuous)
+                            .fill(LinearGradient(colors: [Color(red: 0.90, green: 0.94, blue: 1.0),
+                                                          Color(red: 0.96, green: 0.97, blue: 0.99)],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+                        Circle().fill(.white.opacity(0.60)).frame(width: 215, height: 215)
+                            .blur(radius: 20).offset(x: 75, y: -60)
+                        Image(systemName: "book.closed.fill")
+                            .font(.system(size: 100, weight: .ultraLight))
+                            .foregroundStyle(Color(red: 0.27, green: 0.42, blue: 0.76))
+                            .rotationEffect(.degrees(-12))
+                            .shadow(color: .blue.opacity(0.13), radius: 20, y: 12)
+                        Image(systemName: "viewfinder")
+                            .font(.system(size: 142, weight: .ultraLight))
+                            .foregroundStyle(.blue.opacity(0.42))
+                    }
+                    .frame(height: 222)
+                    .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+                    .padding(.top, 32)
+
+                    Button {
+                        scanning = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "camera.fill")
+                                .font(.system(size: 21, weight: .semibold))
+                            Text(originals.isEmpty ? "Inizia scansione" : "Continua scansione")
+                                .font(.headline)
+                            Spacer()
+                            Image(systemName: "arrow.up.right")
+                                .font(.headline)
+                        }
+                        .padding(.horizontal, 23)
+                        .frame(height: 66)
+                        .foregroundStyle(.white)
+                        .background(Color(red: 0.12, green: 0.35, blue: 0.91),
+                                    in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 24)
+
                     HStack(spacing: 14) {
                         Image(systemName: "square.stack.3d.up")
-                            .font(.title2).foregroundStyle(.blue)
-                            .frame(width: 52, height: 52)
-                            .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-                        VStack(alignment: .leading) {
-                            Text("\(originals.count) pagine acquisite").font(.headline)
-                            Text(pdfSize.map { "Ultimo PDF: \($0)" } ?? "Pronte per l'esportazione")
-                                .font(.caption).foregroundStyle(.secondary)
+                            .font(.system(size: 24, weight: .light))
+                            .foregroundStyle(.blue)
+                            .frame(width: 50, height: 50)
+                            .background(Color.blue.opacity(0.07), in: Circle())
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Sessione corrente").font(.headline)
+                            Text("\(originals.count) pagine" + (pdfSize.map { " · Ultimo PDF: \($0)" } ?? ""))
+                                .font(.subheadline).foregroundStyle(.secondary)
                         }
-                        Spacer()
-                        Button { showPages = true } label: { Image(systemName: "chevron.right") }
-                            .disabled(originals.isEmpty)
+                        Spacer(minLength: 6)
+                        Button { showPages = true } label: {
+                            Image(systemName: "chevron.right")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(width: 44, height: 44)
+                        }
+                        .disabled(originals.isEmpty)
+                        .accessibilityLabel("Apri pagine acquisite")
+                    }
+                    .padding(.vertical, 20)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 15)
+                    Divider().opacity(0.45)
+                    Button { showControls = true } label: {
+                        HStack {
+                            Image(systemName: "wand.and.stars")
+                            Text("\(scanStyle.title) · \(documentProfile.title)")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                        }
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 20)
                     }
                     if !originals.isEmpty {
                         Button { exportPDF() } label: {
                             Label("Esporta PDF", systemImage: "square.and.arrow.up")
-                                .frame(maxWidth: .infinity)
-                        }.buttonStyle(.bordered).disabled(processing)
+                                .frame(maxWidth: .infinity).frame(height: 52)
+                        }
+                        .buttonStyle(.bordered)
+                        .clipShape(Capsule())
+                        .disabled(processing)
                     }
-                }.padding(18).background(.white, in: RoundedRectangle(cornerRadius: 22))
-                Text("Qualità e stile si possono cambiare anche dopo lo scatto, prima di esportare.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 25)
+                .padding(.bottom, 45)
             }
-            .padding(20)
         }
     }
 
     private var scannerScreen: some View {
         GeometryReader { outer in
-            VStack(spacing: 10) {
-                HStack {
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
                     Button { scanning = false } label: {
-                        Image(systemName: "xmark").font(.headline)
-                            .frame(width: 46, height: 46)
+                        Image(systemName: "xmark")
+                            .font(.system(size: 16, weight: .semibold))
+                            .frame(width: 48, height: 48)
                             .background(.white.opacity(0.13), in: Circle())
                     }.accessibilityLabel("Torna alla home")
                     Spacer()
                     VStack(spacing: 2) {
-                        Text("Scansione pagina").font(.headline)
+                        Text("BookScan").font(.headline.weight(.semibold))
                         Text("\(originals.count) pagine acquisite")
-                            .font(.caption).foregroundStyle(.white.opacity(0.7))
+                            .font(.caption).foregroundStyle(.white.opacity(0.64))
                     }
                     Spacer()
-                    Button("Esporta") { exportPDF() }
-                        .font(.subheadline.weight(.semibold))
-                        .disabled(originals.isEmpty || processing)
-                        .frame(minWidth: 65, minHeight: 44)
+                    Button { exportPDF() } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 19, weight: .medium))
+                            .frame(width: 48, height: 48)
+                            .background(.white.opacity(0.13), in: Circle())
+                    }
+                    .disabled(processing || originals.isEmpty)
+                    .accessibilityLabel("Esporta PDF")
                 }
                 .foregroundStyle(.white)
-                .padding(.horizontal, 15)
+                .padding(.horizontal, 18)
+                .padding(.top, 8)
+                .padding(.bottom, 12)
 
                 GeometryReader { available in
-                    let displayWidth = min(available.size.width, available.size.height * 3 / 4)
+                    let displayWidth = min(available.size.width - 16, available.size.height * 0.75)
                     let displayHeight = displayWidth * 4 / 3
-                    ZStack {
-                        CameraPreview(session: camera.session)
-                        CalibrationOverlay(zone: $pageZone, safety: safetyMargin, locked: locked)
-                        if camera.permissionDenied {
-                            Color.black.opacity(0.85)
-                            Text("Abilita la fotocamera nelle Impostazioni")
-                                .foregroundStyle(.white)
+                    ZStack(alignment: .bottom) {
+                        ZStack {
+                            CameraPreview(session: camera.session)
+                            CalibrationOverlay(zone: $pageZone, safety: safetyMargin, locked: locked)
+                            if camera.permissionDenied {
+                                Color.black.opacity(0.85)
+                                Text("Abilita la fotocamera nelle Impostazioni")
+                                    .foregroundStyle(.white)
+                                    .multilineTextAlignment(.center)
+                                    .padding()
+                            }
                         }
+                        .frame(width: displayWidth, height: displayHeight)
+                        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+
+                        Button { locked.toggle() } label: {
+                            Label(locked ? "Ricalibra" : "Blocca ritaglio",
+                                  systemImage: locked ? "lock.fill" : "hand.draw")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16)
+                                .frame(height: 44)
+                                .background(.black.opacity(0.67), in: Capsule())
+                        }
+                        .padding(.bottom, 14)
+                        .accessibilityLabel(locked ? "Sblocca il ritaglio" : "Blocca il ritaglio")
                     }
-                    .frame(width: displayWidth, height: displayHeight)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
                     .frame(width: available.size.width, height: available.size.height)
                 }
                 .frame(maxHeight: .infinity)
 
-                HStack(spacing: 8) {
-                    Image(systemName: locked ? "lock.fill" : "hand.draw")
-                    Text(locked ? "Calibrazione bloccata" : "Sposta i bordi verdi")
-                    Spacer()
-                    Button(locked ? "Ricalibra" : "Blocca") { locked.toggle() }
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.mint)
-                        .frame(minHeight: 44)
-                }.font(.footnote).foregroundStyle(.white)
-                    .padding(.horizontal, 18)
+                HStack {
+                    Text(scanStyle.title)
+                    Circle().frame(width: 3, height: 3)
+                    Text("Margine \(Int(safetyMargin * 100))%")
+                }
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.70))
+                .padding(.vertical, 10)
 
-                HStack(alignment: .center, spacing: 14) {
+                HStack(alignment: .center, spacing: 10) {
                     Button { showControls = true } label: {
                         Image(systemName: "slider.horizontal.3")
-                            .font(.title2)
+                            .font(.system(size: 22))
                             .frame(width: 58, height: 58)
-                            .background(.white.opacity(0.13), in: Circle())
-                    }.accessibilityLabel("Controlli")
+                            .background(.white.opacity(0.12), in: Circle())
+                    }
+                    .accessibilityLabel("Controlli scansione")
                     Spacer(minLength: 0)
                     Button(action: takePhoto) {
                         ZStack {
-                            Circle().stroke(.white.opacity(0.92), lineWidth: 5)
-                                .frame(width: 100, height: 100)
-                            Circle().fill(processing ? Color.gray : .white)
+                            Circle().stroke(.white.opacity(0.94), lineWidth: 5)
+                                .frame(width: 101, height: 101)
+                            Circle().fill(processing ? Color.gray : Color.white)
                                 .frame(width: 82, height: 82)
-                            if processing {
-                                ProgressView().tint(.black)
-                            }
+                            if processing { ProgressView().tint(.black) }
                         }
                         .frame(width: 108, height: 108)
                         .contentShape(Circle())
@@ -203,31 +282,31 @@ struct ContentView: View {
                     Spacer(minLength: 0)
                     Button { showPages = true } label: {
                         ZStack(alignment: .bottomTrailing) {
-                            RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.15))
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(.white.opacity(0.12))
                                 .frame(width: 58, height: 58)
                             if let last = originals.last, let image = UIImage(data: last) {
                                 Image(uiImage: image).resizable().scaledToFill()
                                     .frame(width: 58, height: 58).clipped()
-                                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                             } else {
                                 Image(systemName: "square.stack")
-                                    .frame(width: 58, height: 58)
+                                    .font(.title3).frame(width: 58, height: 58)
                             }
                             Text("\(originals.count)")
                                 .font(.caption2.bold()).foregroundStyle(.black)
-                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .padding(.horizontal, 6).padding(.vertical, 3)
                                 .background(.white, in: Capsule())
-                                .offset(x: 6, y: 6)
+                                .offset(x: 6, y: 5)
                         }
-                    }.accessibilityLabel("Vedi pagine acquisite")
+                    }
+                    .accessibilityLabel("Pagine acquisite")
                 }
                 .foregroundStyle(.white)
-                .padding(.horizontal, 20)
-                .padding(.bottom, 10)
-                Text("\(scanStyle.title) · Margine \(Int(safetyMargin * 100))%")
-                    .font(.caption).foregroundStyle(.white.opacity(0.65))
-                    .padding(.bottom, 4)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 16)
             }
+            .frame(width: outer.size.width, height: outer.size.height)
         }
     }
 
@@ -429,12 +508,12 @@ private struct CalibrationOverlay: View {
     @ViewBuilder
     private func outline(_ rect: CGRect, size: CGSize, color: Color) -> some View {
         let safe = FixedCrop.expanded(rect, margin: safety)
-        Rectangle()
-            .stroke(color.opacity(0.65), style: StrokeStyle(lineWidth: 2, dash: [5, 4]))
+        RoundedRectangle(cornerRadius: 11, style: .continuous)
+            .stroke(color.opacity(0.65), style: StrokeStyle(lineWidth: 1.5, dash: [6, 5]))
             .frame(width: safe.width * size.width, height: safe.height * size.height)
             .position(x: safe.midX * size.width, y: safe.midY * size.height)
             .allowsHitTesting(false)
-        Rectangle()
+        RoundedRectangle(cornerRadius: 9, style: .continuous)
             .stroke(color, lineWidth: 2)
             .frame(width: rect.width * size.width, height: rect.height * size.height)
             .position(x: rect.midX * size.width, y: rect.midY * size.height)
@@ -458,7 +537,7 @@ private struct CalibrationOverlay: View {
             let y = (corner == 0 || corner == 1) ? zone.minY : zone.maxY
             Circle()
                 .fill(color)
-                .frame(width: 25, height: 25)
+                .frame(width: 27, height: 27)
                 .overlay(Circle().stroke(.black, lineWidth: 1.5))
                 .position(x: x * size.width, y: y * size.height)
                 .modifier(ZoneDrag(rect: rect, size: size, corner: corner))
