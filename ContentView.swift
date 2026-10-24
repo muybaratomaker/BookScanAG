@@ -3,7 +3,7 @@ import UIKit
 import CoreImage
 import AudioToolbox
 
-// BookScan AG 1.2: floating Apple Minimal + Scanner filter, single-page scan, reusable crop and document looks.
+// BookScan AG 1.2.1: corrected Scanner filter preserving text contrast, single-page scan, reusable crop and document looks.
 // Compatible with existing CameraView.swift (CameraController / CameraPreview).
 struct ContentView: View {
     @StateObject private var camera = CameraController()
@@ -652,25 +652,16 @@ private enum DocumentRendering {
                 kCIInputSharpnessKey: 0.25
             ])
         case .scanner:
-            // Estimate uneven lighting using a strongly blurred copy of the page.
-            // Divide the original by the local background: whites approach white,
-            // dark letter strokes remain visible, and broad shadows fade.
-            // This is a soft local illumination correction, NOT a hard threshold.
-            let extent = ci.extent
-            let radius = max(24.0, min(extent.width, extent.height) * 0.035)
-            let background = ci.applyingFilter("CIGaussianBlur", parameters: [
-                kCIInputRadiusKey: radius
-            ]).cropped(to: extent)
-            let normalized = ci.applyingFilter("CIDivideBlendMode", parameters: [
-                kCIInputBackgroundImageKey: background
-            ]).cropped(to: extent)
-            ci = normalized.applyingFilter("CIColorControls", parameters: [
+            // Safe scan look: retain dark letter strokes while lifting light paper.
+            // IMPORTANT: Do not divide the photo by a blurred background here:
+            // that previously normalized dark strokes almost to white.
+            ci = ci.applyingFilter("CIColorControls", parameters: [
                 kCIInputSaturationKey: 0,
-                kCIInputContrastKey: 1.22,
-                kCIInputBrightnessKey: 0.005
+                kCIInputContrastKey: 1.30,
+                kCIInputBrightnessKey: 0.025
             ])
             ci = ci.applyingFilter("CISharpenLuminance", parameters: [
-                kCIInputSharpnessKey: 0.20
+                kCIInputSharpnessKey: 0.22
             ])
         case .blackWhite:
             ci = ci.applyingFilter("CIColorControls", parameters: [
