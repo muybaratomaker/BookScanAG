@@ -3,7 +3,7 @@ import UIKit
 import CoreImage
 import AudioToolbox
 
-// BookScan AG 1.1: floating Apple Minimal redesign, single-page scan, reusable crop and document looks.
+// BookScan AG 1.2: floating Apple Minimal + Scanner filter, single-page scan, reusable crop and document looks.
 // Compatible with existing CameraView.swift (CameraController / CameraPreview).
 struct ContentView: View {
     @StateObject private var camera = CameraController()
@@ -23,7 +23,7 @@ struct ContentView: View {
     @State private var safetyMargin = 0.07
     @State private var locked = false
     @State private var documentProfile: DocumentProfile = .compact
-    @State private var scanStyle: ScanStyle = .optimized
+    @State private var scanStyle: ScanStyle = .scanner
 
     var body: some View {
         NavigationStack {
@@ -323,7 +323,7 @@ struct ContentView: View {
                 Section("Aspetto scansione") {
                     Picker("Stile", selection: $scanStyle) {
                         ForEach(ScanStyle.allCases) { style in Text(style.title).tag(style) }
-                    }.pickerStyle(.segmented)
+                    }.pickerStyle(.menu)
                     Text(scanStyle.description).font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Ritaglio") {
@@ -471,20 +471,22 @@ struct ContentView: View {
 }
 
 private enum ScanStyle: String, CaseIterable, Identifiable {
-    case natural, optimized, blackWhite
+    case natural, optimized, scanner, blackWhite
     var id: String { rawValue }
     var title: String {
         switch self {
         case .natural: return "Naturale"
         case .optimized: return "Ottimizzato"
+        case .scanner: return "Scanner"
         case .blackWhite: return "Bianco e nero"
         }
     }
     var description: String {
         switch self {
         case .natural: return "Grigi naturali, contrasto delicato."
-        case .optimized: return "Sfondo più chiaro e testo ben contrastato, senza soglie aggressive."
-        case .blackWhite: return "Bianco e nero con contrasto elevato: controlla i caratteri sottili."
+        case .optimized: return "Sfondo più chiaro e testo ben contrastato."
+        case .scanner: return "Bianco uniforme e ombre attenuate: ideale per pagine di libri."
+        case .blackWhite: return "Contrasto forte; verifica i caratteri sottili prima di esportare."
         }
     }
 }
@@ -626,28 +628,62 @@ private enum FixedCrop {
 }
 
 private enum DocumentRendering {
+    // The image is processed ONLY at PDF export. Original cropped JPEGs are kept
+    // untouched so users can re-export using a different look.
     static func render(_ jpeg: Data, profile: DocumentProfile, style: ScanStyle) -> Data? {
         guard let image = UIImage(data: jpeg), let cg = image.cgImage else { return nil }
         var ci = CIImage(cgImage: cg)
-        let contrast: CGFloat
-        let brightness: CGFloat
-        switch style {
-        case .natural: contrast = 1.06; brightness = 0.008
-        case .optimized: contrast = 1.16; brightness = 0.035
-        case .blackWhite: contrast = 1.65; brightness = 0.06
-        }
         ci = ci.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: 0,
-            kCIInputContrastKey: contrast,
-            kCIInputBrightnessKey: brightness
+            kCIInputSaturationKey: 0
         ])
-        // Mild sharpening of fine strokes; no hard threshold in any of the presets.
-        if style == .optimized || style == .blackWhite {
+
+        switch style {
+        case .natural:
+            ci = ci.applyingFilter("CIColorControls", parameters: [
+                kCIInputContrastKey: 1.06,
+                kCIInputBrightnessKey: 0.008
+            ])
+        case .optimized:
+            ci = ci.applyingFilter("CIColorControls", parameters: [
+                kCIInputContrastKey: 1.16,
+                kCIInputBrightnessKey: 0.035
+            ])
             ci = ci.applyingFilter("CISharpenLuminance", parameters: [
-                kCIInputSharpnessKey: style == .optimized ? 0.25 : 0.35
+                kCIInputSharpnessKey: 0.25
+            ])
+        case .scanner:
+            // Estimate uneven lighting using a strongly blurred copy of the page.
+            // Divide the original by the local background: whites approach white,
+            // dark letter strokes remain visible, and broad shadows fade.
+            // This is a soft local illumination correction, NOT a hard threshold.
+            let extent = ci.extent
+            let radius = max(24.0, min(extent.width, extent.height) * 0.035)
+            let background = ci.applyingFilter("CIGaussianBlur", parameters: [
+                kCIInputRadiusKey: radius
+            ]).cropped(to: extent)
+            let normalized = ci.applyingFilter("CIDivideBlendMode", parameters: [
+                kCIInputBackgroundImageKey: background
+            ]).cropped(to: extent)
+            ci = normalized.applyingFilter("CIColorControls", parameters: [
+                kCIInputSaturationKey: 0,
+                kCIInputContrastKey: 1.22,
+                kCIInputBrightnessKey: 0.005
+            ])
+            ci = ci.applyingFilter("CISharpenLuminance", parameters: [
+                kCIInputSharpnessKey: 0.20
+            ])
+        case .blackWhite:
+            ci = ci.applyingFilter("CIColorControls", parameters: [
+                kCIInputContrastKey: 1.65,
+                kCIInputBrightnessKey: 0.06
+            ])
+            ci = ci.applyingFilter("CISharpenLuminance", parameters: [
+                kCIInputSharpnessKey: 0.35
             ])
         }
-        guard let output = CIContext().createCGImage(ci, from: ci.extent) else { return nil }
+
+        let context = CIContext()
+        guard let output = context.createCGImage(ci, from: ci.extent) else { return nil }
         let page = UIImage(cgImage: output)
         let factor = min(1, CGFloat(profile.longEdge) / max(page.size.width, page.size.height))
         let target = CGSize(width: max(1, (page.size.width * factor).rounded()),
