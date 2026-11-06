@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 var checks = 0
 func check(_ value: @autoclosure () -> Bool, _ label: String) {

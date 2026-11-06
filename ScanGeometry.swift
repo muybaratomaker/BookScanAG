@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
+// Apple platforms need the CoreGraphics Swift overlay for CGRect/CGPoint
+// initializers and properties. Linux provides these types through Foundation.
 /// Portable pixel algorithms, shared by the iOS pipeline and command-line tests.
 /// Coordinates and raster rows use a top-left origin throughout.
 enum ScanGeometry {

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 /// Shared conservative acceptance rules. An uncertain proposal is displayed for review,
 /// never silently promoted to the crop just because a contour exists.
