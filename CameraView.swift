@@ -1,11 +1,9 @@
 import SwiftUI
 import AVFoundation
 import UIKit
-import CoreImage
 
 struct LivePage: Equatable {
-    // Points are normalized in top-left image coordinates, clockwise.
-    let points: [CGPoint]
+    let points: [CGPoint] // Normalized top-left coordinates, after portrait rotation.
 }
 
 final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -14,27 +12,40 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
     private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "bookscan.camera.session")
     private let visionQueue = DispatchQueue(label: "bookscan.camera.vision")
+    private let detector = PageSegmentationService()
     @Published var permissionDenied = false
+    @Published var ready = false
     @Published var livePages: [LivePage] = []
-    @Published var scanStatus = "Inquadra il libro aperto"
-    @Published var autoEnabled = false
-    var onPhoto: ((UIImage) -> Void)?
-    var onAutoCapture: (() -> Void)?
-
+    @Published var liveUncertain = true
+    @Published var scanStatus = "Inquadra una pagina"
+    var onPhoto: ((Data) -> Void)?
+    var onError: ((String) -> Void)?
     private var configured = false
-    private var processingFrame = false
-    private var previousBoxes: [CGRect] = []
-    private var stableFrames = 0
-    private var lastVisionTime: CFTimeInterval = 0
-    private var waitingForTurn = false
-    private var absentFrames = 0
     private var captureInFlight = false
+    // All tracking state is owned exclusively by visionQueue.
+    private var detectionEnabled = true
+    private var previousContour: [CGPoint] = []
+    private var lastDetection: CFTimeInterval = 0
+    private var lastVisionTime: CFTimeInterval = 0
+
+    func setRecognitionEnabled(_ enabled: Bool) {
+        visionQueue.async {
+            self.detectionEnabled = enabled
+            self.previousContour = []
+            self.lastDetection = 0
+            DispatchQueue.main.async {
+                self.livePages = []
+                self.liveUncertain = true
+                self.scanStatus = enabled ? "Cerco la superficie della pagina…" : "Ritaglio manuale"
+            }
+        }
+    }
 
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
             guard let self else { return }
             guard granted else {
-                DispatchQueue.main.async { self.permissionDenied = true }
+                DispatchQueue.main.async { self.permissionDenied = true; self.ready = false }
                 return
             }
             self.sessionQueue.async {
@@ -43,24 +54,35 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
                     self.session.sessionPreset = .photo
                     guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
                           let input = try? AVCaptureDeviceInput(device: device),
-                          self.session.canAddInput(input),
-                          self.session.canAddOutput(self.photoOutput),
+                          self.session.canAddInput(input), self.session.canAddOutput(self.photoOutput),
                           self.session.canAddOutput(self.videoOutput) else {
                         self.session.commitConfiguration()
+                        self.fail("Fotocamera non disponibile")
                         return
                     }
                     self.session.addInput(input)
                     self.session.addOutput(self.photoOutput)
                     self.videoOutput.alwaysDiscardsLateVideoFrames = true
+                    self.videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
                     self.videoOutput.setSampleBufferDelegate(self, queue: self.visionQueue)
                     self.session.addOutput(self.videoOutput)
-                    if let connection = self.videoOutput.connection(with: .video), connection.isVideoOrientationSupported {
-                        connection.videoOrientation = .portrait
+                    for output in [self.photoOutput as AVCaptureOutput, self.videoOutput as AVCaptureOutput] {
+                        if let connection = output.connection(with: .video), connection.isVideoOrientationSupported {
+                            connection.videoOrientation = .portrait
+                        }
                     }
+                    do {
+                        try device.lockForConfiguration()
+                        device.videoZoomFactor = 1
+                        device.unlockForConfiguration()
+                    } catch { /* Device default is still the physical main camera. */ }
                     self.session.commitConfiguration()
                     self.configured = true
                 }
                 if !self.session.isRunning { self.session.startRunning() }
+                let running = self.session.isRunning
+                DispatchQueue.main.async { self.permissionDenied = false; self.ready = running }
+                if !running { self.fail("Impossibile avviare la fotocamera") }
             }
         }
     }
@@ -68,91 +90,67 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
     func stop() {
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
+            DispatchQueue.main.async { self.ready = false }
         }
     }
 
     func capture() {
         sessionQueue.async {
-            guard self.session.isRunning, !self.captureInFlight else { return }
+            guard self.session.isRunning, !self.captureInFlight else {
+                self.fail("Fotocamera occupata o interrotta: riprova")
+                return
+            }
             self.captureInFlight = true
             self.photoOutput.capturePhoto(with: AVCapturePhotoSettings(), delegate: self)
         }
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        let image = photo.fileDataRepresentation().flatMap(UIImage.init(data:))
-        sessionQueue.async { self.captureInFlight = false }
-        guard error == nil, let image else {
-            DispatchQueue.main.async { self.scanStatus = "Scatto non riuscito: riprova" }
+        guard error == nil, let data = photo.fileDataRepresentation() else {
+            fail("Scatto non riuscito: riprova")
             return
         }
-        DispatchQueue.main.async { self.onPhoto?(image) }
+        DispatchQueue.main.async { self.onPhoto?(data) }
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
+        sessionQueue.async { self.captureInFlight = false }
+        if let error { fail(error.localizedDescription) }
+    }
+
+    private func fail(_ message: String) {
+        DispatchQueue.main.async { self.scanStatus = message; self.onError?(message) }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         let now = CACurrentMediaTime()
-        guard now - lastVisionTime >= 0.30, !processingFrame,
+        guard detectionEnabled, now - lastVisionTime >= 0.35,
               let pixel = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lastVisionTime = now
-        processingFrame = true
-        defer { processingFrame = false }
-        // Segment bright paper regions instead of searching for rectangles.
-        let result = BookPageDetector.detect(pixelBuffer: pixel)
-        let selected = result?.pages ?? []
-        let boxes = selected.map { page -> CGRect in
-            let xs = page.points.map(\.x), ys = page.points.map(\.y)
-            return CGRect(x: xs.min() ?? 0, y: ys.min() ?? 0,
-                          width: (xs.max() ?? 0) - (xs.min() ?? 0),
-                          height: (ys.max() ?? 0) - (ys.min() ?? 0))
-        }
-var stable = false
-
-if boxes.count == 2 && previousBoxes.count == 2 {
-    stable = true
-
-    for index in 0..<2 {
-        let current = boxes[index]
-        let previous = previousBoxes[index]
-
-        let dx = abs(current.midX - previous.midX)
-        let dy = abs(current.midY - previous.midY)
-        let dw = abs(current.width - previous.width)
-        let dh = abs(current.height - previous.height)
-
-        if dx >= 0.016 ||
-           dy >= 0.016 ||
-           dw >= 0.020 ||
-           dh >= 0.020 {
-            stable = false
-            break
-        }
-    }
-}
-        stableFrames = stable ? stableFrames + 1 : 0
-        previousBoxes = boxes
-        if boxes.count < 2 { absentFrames += 1 } else { absentFrames = 0 }
-        if waitingForTurn && absentFrames >= 5 {
-            waitingForTurn = false
-            stableFrames = 0
-        }
-        // Intentionally conservative: automatic capture can be enabled by the user.
-        let shouldCapture = stableFrames >= 7 && !waitingForTurn &&
-                            selected.count == 2 && autoEnabled
-        if shouldCapture { waitingForTurn = true; stableFrames = 0 }
+        let result = detector.detect(pixelBuffer: pixel)
+        var points = result?.contour ?? []
+        var uncertain = result?.needsReview ?? true
+        if !points.isEmpty {
+            // Smooth only compatible, small movements. Larger movements must track immediately.
+            if points.count == previousContour.count {
+                let drift = zip(points, previousContour).map { hypot($0.x - $1.x, $0.y - $1.y) }.max() ?? 1
+                if drift < 0.06 {
+                    points = zip(points, previousContour).map { CGPoint(x: 0.65 * $0.x + 0.35 * $1.x,
+                                                                        y: 0.65 * $0.y + 0.35 * $1.y) }
+                }
+            }
+            previousContour = points
+            lastDetection = now
+        } else if now - lastDetection < 0.9 {
+            points = previousContour
+            uncertain = true // Stale evidence is never green.
+        } else { previousContour = [] }
+        let pages = points.isEmpty ? [] : [LivePage(points: points)]
+        let status = points.isEmpty ? "Cerco la superficie della pagina…" : (uncertain ? "Contorno da controllare" : "Pagina individuata")
         DispatchQueue.main.async {
-            self.livePages = selected
-            self.scanStatus = selected.count == 2
-                ? (stable ? "Libro individuato · tieni fermo" : "Contorni in verifica…")
-                : "Cerco le superfici delle pagine…"
-            if shouldCapture && self.autoEnabled { self.onAutoCapture?() }
-        }
-    }
-
-    func resetAutoCapture() {
-        visionQueue.async {
-            self.waitingForTurn = false
-            self.stableFrames = 0
-            self.previousBoxes = []
+            self.livePages = pages
+            self.liveUncertain = uncertain
+            self.scanStatus = status
         }
     }
 }
@@ -163,11 +161,13 @@ struct CameraPreview: UIViewRepresentable {
         let view = PreviewView()
         view.previewLayer.videoGravity = .resizeAspect
         view.previewLayer.session = session
+        if let connection = view.previewLayer.connection, connection.isVideoOrientationSupported {
+            connection.videoOrientation = .portrait
+        }
         return view
     }
     func updateUIView(_ uiView: PreviewView, context: Context) {}
 }
-
 final class PreviewView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }

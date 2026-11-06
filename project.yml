@@ -17,6 +17,10 @@ targets:
       - path: .
         includes:
           - "*.swift"
+      - path: Models/UVDoc.mlpackage
+        buildPhase: sources
+      - path: Models/UVDoc-LICENSE.txt
+        buildPhase: resources
       - path: Assets.xcassets
         buildPhase: resources
     settings:
