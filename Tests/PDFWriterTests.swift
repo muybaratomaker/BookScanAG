@@ -60,6 +60,20 @@ struct PDFWriterTests {
             fatalError("Skipped a broken page")
         } catch ExpectedFailure.interrupted {}
         precondition(!FileManager.default.fileExists(atPath: partial.path))
+        for captures in [1, 20] {
+            let count = captures * 2
+            let pairs = directory.appendingPathComponent("pairs-\(captures).pdf")
+            var order: [String] = []
+            try ScanPDFWriter.write(pageCount: count, to: pairs) { index in
+                order.append("\(index / 2)-\(index % 2 == 0 ? "left" : "right")")
+                return PDFRaster(jpeg: jpeg, width: 12, height: 16)
+            }
+            let expected = (0..<captures).flatMap { ["\($0)-left", "\($0)-right"] }
+            precondition(order == expected)
+            let contents = try Data(contentsOf: pairs)
+            precondition(String(decoding: contents, as: UTF8.self).contains("/Count \(count) /Kids"))
+            print("PASS: \(captures) spread(s), \(count) PDF pages in left/right order")
+        }
         // Optional destination for independent PDF readers (pdfinfo/pdftoppm).
         if CommandLine.arguments.count > 1 {
             try data.write(to: URL(fileURLWithPath: CommandLine.arguments[1]), options: .atomic)

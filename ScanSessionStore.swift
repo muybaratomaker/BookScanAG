@@ -1,6 +1,6 @@
 import Foundation
+import CoreGraphics
 import Combine
-import UIKit
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -39,6 +39,12 @@ struct ScanPage: Identifiable, Codable {
     var hasCorrected = false
     var cropRect: CGRect?
     var proposedContour: [CGPoint] = []
+    // Optional fields preserve decoding of pre-spread session manifests.
+    var captureID: UUID?
+    var spreadSide: String?
+    var spreadSeam: [CGPoint]?
+    var spreadBounds: CGRect?
+    var revision: UUID?
 
     var variants: [ScanVariant] {
         [.original] + (hasCropped ? [.cropped] : []) + (hasCorrected ? [.corrected] : [])
@@ -64,6 +70,7 @@ final class ScanSessionStore: ObservableObject {
     @Published var errorMessage: String?
     private let root: URL
     private var writable = false
+    private var siblingOperations = Set<UUID>()
     private var manifestURL: URL { root.appendingPathComponent("session.json") }
 
     init(directory: URL? = nil) {
@@ -102,7 +109,7 @@ final class ScanSessionStore: ObservableObject {
         try await Task.detached(priority: .userInitiated) {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             // Save before decoding: even an unusual/corrupt photo remains recoverable.
-            try data.write(to: original, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            try data.write(to: original, options: Self.protectedWriteOptions)
             try? Self.writeThumbnail(data, to: thumbnail)
         }.value
         let updated = pages + [page]
@@ -111,15 +118,110 @@ final class ScanSessionStore: ObservableObject {
         return page
     }
 
+    /// Both entries own a hard link to the same immutable camera file. Removing
+    /// either page cannot remove the other's original or duplicate the photo bytes.
+    func addSibling(of page: ScanPage) async throws -> ScanPage {
+        guard writable, let source = pages.first(where: { $0.id == page.id }) else {
+            throw ScanStorageError.missingPage
+        }
+        let capture = source.captureID ?? source.id
+        if let existing = pages.first(where: { $0.captureID == capture && $0.id != source.id }) {
+            return existing
+        }
+        guard !siblingOperations.contains(capture) else { throw ScanStorageError.missingPage }
+        siblingOperations.insert(capture)
+        defer { siblingOperations.remove(capture) }
+        var sibling = ScanPage()
+        sibling.captureID = capture
+        sibling.spreadSide = "right"
+        sibling.spreadSeam = source.spreadSeam
+        sibling.spreadBounds = source.spreadBounds
+        let directory = pageDirectory(sibling.id)
+        let staging = root.appendingPathComponent(".pending-\(sibling.id.uuidString)")
+        let sourceDirectory = pageDirectory(source.id)
+        try await Task.detached(priority: .userInitiated) {
+            let files = FileManager.default
+            try files.createDirectory(at: staging, withIntermediateDirectories: true)
+            do {
+                try files.linkItem(at: sourceDirectory.appendingPathComponent("original.source"),
+                                   to: staging.appendingPathComponent("original.source"))
+                let thumbnail = sourceDirectory.appendingPathComponent("thumb-original.jpg")
+                if files.fileExists(atPath: thumbnail.path) {
+                    try files.linkItem(at: thumbnail, to: staging.appendingPathComponent("thumb-original.jpg"))
+                }
+                // If interrupted before the manifest commit, recovery must not
+                // expose this uncommitted hard link as a duplicate full photo.
+                try Data().write(to: staging.appendingPathComponent(".pending-sibling"))
+                try files.moveItem(at: staging, to: directory)
+            } catch {
+                try? files.removeItem(at: staging)
+                throw error
+            }
+        }.value
+        // A deletion can happen while file work is suspended. Never append an
+        // orphan sibling to a session whose source page has been removed.
+        guard let index = pages.firstIndex(where: { $0.id == source.id }) else {
+            try? FileManager.default.removeItem(at: directory)
+            throw ScanStorageError.missingPage
+        }
+        var updated = pages
+        updated[index].captureID = capture
+        updated[index].spreadSide = "left"
+        updated.insert(sibling, at: index + 1)
+        do {
+            try persist(updated)
+            pages = updated
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(".pending-sibling"))
+        } catch {
+            // The source's hard link still owns the original, so this uncommitted
+            // sibling can be removed safely rather than recovered as a duplicate.
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        return sibling
+    }
+
+    @discardableResult
+    func applyProcessed(_ result: ProcessedScan, to page: ScanPage) async throws -> ScanPage {
+        try await saveVariant(result.cropped, for: page.id, variant: .cropped)
+        if let corrected = result.corrected {
+            try await saveVariant(corrected, for: page.id, variant: .corrected)
+        }
+        guard var current = pages.first(where: { $0.id == page.id }) else { throw ScanStorageError.missingPage }
+        current.hasCropped = true
+        current.hasCorrected = result.corrected != nil
+        current.selectedVariant = result.selectedVariant
+        current.status = result.status
+        current.message = result.message
+        current.cropRect = result.cropRect
+        current.proposedContour = result.contour
+        try update(current)
+        return pages.first(where: { $0.id == page.id }) ?? current
+    }
+
+    /// Commit invalidation first. A leftover file after interruption must never
+    /// become a selectable correction of a newer, different crop on restore.
+    func discardCorrected(for pageID: UUID) throws {
+        guard var page = pages.first(where: { $0.id == pageID }) else { throw ScanStorageError.missingPage }
+        page.hasCorrected = false
+        if page.selectedVariant == .corrected { page.selectedVariant = page.hasCropped ? .cropped : .original }
+        try update(page)
+        for name in ["corrected.png", "thumb-corrected.jpg"] {
+            let file = pageDirectory(pageID).appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+        }
+    }
+
     func saveVariant(_ data: Data, for pageID: UUID, variant: ScanVariant) async throws {
         guard writable else { throw ScanStorageError.missingPage }
         guard variant != .original else { throw ScanStorageError.invalidVariant }
         guard pages.contains(where: { $0.id == pageID }) else { throw ScanStorageError.missingPage }
+        if variant == .cropped { try discardCorrected(for: pageID) }
         let target = pageDirectory(pageID).appendingPathComponent(filename(variant))
         let thumbnail = pageDirectory(pageID).appendingPathComponent("thumb-\(variant.rawValue).jpg")
         try await Task.detached(priority: .userInitiated) {
             guard CGImageSourceCreateWithData(data as CFData, nil) != nil else { throw ScanStorageError.invalidImage }
-            try data.write(to: target, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            try data.write(to: target, options: Self.protectedWriteOptions)
             try? Self.writeThumbnail(data, to: thumbnail)
         }.value
         guard var page = pages.first(where: { $0.id == pageID }) else { throw ScanStorageError.missingPage }
@@ -134,6 +236,7 @@ final class ScanSessionStore: ObservableObject {
         guard page.variants.contains(page.selectedVariant) else { throw ScanStorageError.invalidVariant }
         var updated = pages
         updated[index] = page
+        updated[index].revision = UUID()
         try persist(updated)
         pages = updated
     }
@@ -146,14 +249,18 @@ final class ScanSessionStore: ObservableObject {
     }
 
     func removeLast() throws {
-        guard writable else { throw ScanStorageError.missingPage }
         guard let last = pages.last else { return }
-        let directory = pageDirectory(last.id)
-        let trash = root.appendingPathComponent(".trash-\(last.id.uuidString)")
+        try remove(pageID: last.id)
+    }
+
+    func remove(pageID: UUID) throws {
+        guard writable, pages.contains(where: { $0.id == pageID }) else { throw ScanStorageError.missingPage }
+        let directory = pageDirectory(pageID)
+        let trash = root.appendingPathComponent(".trash-\(pageID.uuidString)")
         let exists = FileManager.default.fileExists(atPath: directory.path)
         if exists { try FileManager.default.moveItem(at: directory, to: trash) }
         do {
-            let updated = Array(pages.dropLast())
+            let updated = pages.filter { $0.id != pageID }
             try persist(updated)
             pages = updated
         } catch {
@@ -179,7 +286,7 @@ final class ScanSessionStore: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try encoder.encode(updated).write(to: manifestURL,
-            options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            options: Self.protectedWriteOptions)
     }
 
     private func restore() throws {
@@ -205,22 +312,26 @@ final class ScanSessionStore: ObservableObject {
         }
         let folders = try FileManager.default.contentsOfDirectory(at: root,
             includingPropertiesForKeys: [.creationDateKey], options: [.skipsHiddenFiles])
+        var recovered: [ScanPage] = []
         for folder in folders {
             guard let id = UUID(uuidString: folder.lastPathComponent),
                   !restored.contains(where: { $0.id == id }),
+                  !FileManager.default.fileExists(atPath: folder.appendingPathComponent(".pending-sibling").path),
                   FileManager.default.fileExists(atPath: folder.appendingPathComponent("original.source").path) else { continue }
             var page = ScanPage()
             page.id = id
             page.createdAt = (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
             page.status = .review
             page.message = "Originale recuperato dopo un'interruzione."
-            restored.append(page)
+            recovered.append(page)
         }
-        restored.sort { $0.createdAt < $1.createdAt }
+        // Keep the committed order (including pairs and future user reordering).
+        // Only files absent from the manifest are ordered by acquisition date.
+        restored += recovered.sorted { $0.createdAt < $1.createdAt }
         for index in restored.indices {
             let directory = pageDirectory(restored[index].id)
-            restored[index].hasCropped = FileManager.default.fileExists(atPath: directory.appendingPathComponent("cropped.png").path)
-            restored[index].hasCorrected = FileManager.default.fileExists(atPath: directory.appendingPathComponent("corrected.png").path)
+            restored[index].hasCropped = restored[index].hasCropped && FileManager.default.fileExists(atPath: directory.appendingPathComponent("cropped.png").path)
+            restored[index].hasCorrected = restored[index].hasCorrected && FileManager.default.fileExists(atPath: directory.appendingPathComponent("corrected.png").path)
             if !restored[index].variants.contains(restored[index].selectedVariant) {
                 restored[index].selectedVariant = .original
             }
@@ -237,6 +348,15 @@ final class ScanSessionStore: ObservableObject {
         pages = restored
     }
 
+    nonisolated private static var protectedWriteOptions: Data.WritingOptions {
+        #if os(iOS)
+        return [.atomic, .completeFileProtectionUntilFirstUserAuthentication]
+        #else
+        // macOS command-line fixtures use the same store with ordinary atomic files.
+        return [.atomic]
+        #endif
+    }
+
     nonisolated private static func writeThumbnail(_ data: Data, to url: URL) throws {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
@@ -251,6 +371,6 @@ final class ScanSessionStore: ObservableObject {
         }
         CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.75] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw ScanStorageError.invalidImage }
-        try (encoded as Data).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try (encoded as Data).write(to: url, options: Self.protectedWriteOptions)
     }
 }

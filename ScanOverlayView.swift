@@ -20,3 +20,18 @@ struct ScanOverlayView: View {
         .accessibilityLabel(uncertain ? "Contorno da controllare" : "Contorno pagina")
     }
 }
+
+struct ScanSeamOverlay: View {
+    let points: [CGPoint]
+    var body: some View {
+        GeometryReader { geo in
+            Path { path in
+                guard let first = points.first else { return }
+                path.move(to: CGPoint(x: first.x * geo.size.width, y: first.y * geo.size.height))
+                for point in points.dropFirst() {
+                    path.addLine(to: CGPoint(x: point.x * geo.size.width, y: point.y * geo.size.height))
+                }
+            }.stroke(Color.yellow, style: StrokeStyle(lineWidth: 2, dash: [5, 4]))
+        }.allowsHitTesting(false)
+    }
+}

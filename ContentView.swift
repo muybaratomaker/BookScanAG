@@ -20,9 +20,10 @@ struct ContentView: View {
     @State private var pipeline = ScanProcessingPipeline()
     @State private var automaticRecognition = true
     @State private var correctCurvature = false
+    @State private var scanMode: ScanMode = .single
     @State private var pendingOptions: ScanProcessingOptions?
     @State private var pageZone = CGRect(x: 0.075, y: 0.10, width: 0.85, height: 0.80)
-    @State private var safetyMargin = 0.07
+    @State private var safetyMargin = 0.03
     @State private var locked = false
     @State private var documentProfile: DocumentProfile = .compact
     @State private var scanStyle: ScanStyle = .scanner
@@ -36,6 +37,8 @@ struct ContentView: View {
             .toolbar(.hidden, for: .navigationBar)
             .background(scanning ? Color.black : Color(uiColor: .systemGroupedBackground))
             .onAppear { configureCamera() }
+            .onChange(of: scanMode) { mode in camera.setMode(mode, margin: safetyMargin) }
+            .onChange(of: safetyMargin) { margin in camera.setMode(scanMode, margin: margin) }
             .onChange(of: automaticRecognition) { enabled in camera.setRecognitionEnabled(enabled) }
             .onChange(of: store.errorMessage) { message in if let message { errorMessage = message } }
             .onDisappear { camera.stop() }
@@ -217,14 +220,22 @@ struct ContentView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 12)
 
+                Picker("Modalità scansione", selection: $scanMode) {
+                    ForEach(ScanMode.allCases) { mode in Text(mode.title).tag(mode) }
+                }.pickerStyle(.segmented).padding(.horizontal).disabled(processing)
+
                 GeometryReader { available in
-                    let displayWidth = min(available.size.width - 16, available.size.height * 0.75)
-                    let displayHeight = displayWidth * 4 / 3
+                    let aspect = max(0.1, camera.frameAspect)
+                    let displayWidth = min(available.size.width - 16, available.size.height * aspect)
+                    let displayHeight = displayWidth / aspect
                     ZStack(alignment: .bottom) {
                         ZStack {
                             CameraPreview(session: camera.session)
                             if automaticRecognition {
-                                ScanOverlayView(contour: camera.livePages.first?.points ?? [], uncertain: camera.liveUncertain)
+                                ForEach(Array(camera.livePages.enumerated()), id: \.offset) { _, page in
+                                    ScanOverlayView(contour: page.points, uncertain: camera.liveUncertain)
+                                }
+                                ScanSeamOverlay(points: camera.liveSeam)
                             } else {
                                 CalibrationOverlay(zone: $pageZone, safety: safetyMargin, locked: locked)
                             }
@@ -287,7 +298,7 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     .disabled(processing || camera.permissionDenied || !camera.ready)
                     .accessibilityLabel("Scatta pagina")
-                    .accessibilityHint("Aggiunge una pagina alla sessione")
+                    .accessibilityHint(scanMode == .book ? "Acquisisce due pagine, sinistra poi destra" : "Aggiunge una pagina alla sessione")
                     Spacer(minLength: 0)
                     Button { showPages = true } label: {
                         ZStack(alignment: .bottomTrailing) {
@@ -295,7 +306,7 @@ struct ContentView: View {
                                 .fill(.white.opacity(0.12))
                                 .frame(width: 58, height: 58)
                             if let last = store.pages.last {
-                                ScanFileImage(url: store.thumbnailURL(for: last), maxPixelSize: 240)
+                                ScanFileImage(url: store.thumbnailURL(for: last), maxPixelSize: 240).id(last.revision)
                                     .frame(width: 58, height: 58).clipped()
                                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                             } else {
@@ -351,7 +362,7 @@ struct ContentView: View {
                         Text("\(Int(safetyMargin * 100))%")
                             .foregroundStyle(.secondary)
                     }
-                    Slider(value: $safetyMargin, in: 0.03...0.12, step: 0.01)
+                    Slider(value: $safetyMargin, in: 0.01...0.08, step: 0.01)
                         .disabled(locked)
                     Button(locked ? "Sblocca calibrazione" : "Blocca calibrazione") {
                         locked.toggle()
@@ -391,7 +402,7 @@ struct ContentView: View {
                             ScanReviewView(store: store, pageID: page.id, pipeline: pipeline, processing: $processing)
                         } label: {
                             VStack(spacing: 6) {
-                                ScanFileImage(url: store.thumbnailURL(for: page), maxPixelSize: 240)
+                                ScanFileImage(url: store.thumbnailURL(for: page), maxPixelSize: 240).id(page.revision)
                                     .frame(maxWidth: .infinity).frame(height: 200)
                                     .background(Color(uiColor: .secondarySystemBackground))
                                     .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -423,9 +434,10 @@ struct ContentView: View {
 
     private func configureCamera() {
         camera.setRecognitionEnabled(automaticRecognition)
+        camera.setMode(scanMode, margin: safetyMargin)
         camera.onError = { message in processing = false; pendingOptions = nil; errorMessage = message }
         camera.onPhoto = { data in
-            let options = pendingOptions ?? ScanProcessingOptions(automatic: automaticRecognition, dewarp: correctCurvature, zone: pageZone, margin: safetyMargin)
+            let options = pendingOptions ?? ScanProcessingOptions(automatic: automaticRecognition, dewarp: correctCurvature, zone: pageZone, margin: safetyMargin, mode: scanMode)
             pendingOptions = nil
             Task { @MainActor in
                 var acquired: ScanPage?
@@ -436,27 +448,34 @@ struct ContentView: View {
                     page.status = .processing
                     try store.update(page)
                     guard let url = store.url(for: page, variant: .original) else { throw ScanProcessingError.unreadable }
-                    let result = try await pipeline.process(originalURL: url, options: options)
-                    try await store.saveVariant(result.cropped, for: page.id, variant: .cropped)
-                    if let corrected = result.corrected {
-                        try await store.saveVariant(corrected, for: page.id, variant: .corrected)
+                    let capture = try await pipeline.processCapture(originalURL: url, options: options)
+                    var targets = [page]
+                    if capture.pages.count == 2 {
+                        let right = try await store.addSibling(of: page)
+                        targets = [store.pages.first(where: { $0.id == page.id }) ?? page, right]
                     }
-                    page.hasCropped = true
-                    page.hasCorrected = result.corrected != nil
-                    page.selectedVariant = result.selectedVariant
-                    page.status = result.status
-                    page.message = result.message
-                    page.cropRect = result.cropRect
-                    page.proposedContour = result.contour
-                    try store.update(page)
+                    for (index, result) in capture.pages.enumerated() {
+                        var target = targets[index]
+                        if options.mode == .book {
+                            target.captureID = page.id
+                            target.spreadSide = capture.pages.count == 2 ? (index == 0 ? "left" : "right") : "pending"
+                            target.spreadSeam = capture.seam
+                            target.spreadBounds = capture.bounds
+                        }
+                        try store.update(target)
+                        _ = try await store.applyProcessed(result, to: target)
+                    }
                     pdfSize = nil
                     AudioServicesPlaySystemSound(1104)
                 } catch {
-                    if var page = acquired {
-                        page.status = .failed
-                        page.message = error.localizedDescription
-                        page.selectedVariant = .original
-                        do { try store.update(page) } catch { errorMessage = error.localizedDescription }
+                    if let acquired {
+                        for var failed in store.pages where (failed.id == acquired.id || failed.captureID == acquired.id)
+                            && (failed.status == .processing || failed.status == .acquired) {
+                            failed.status = .failed
+                            failed.message = error.localizedDescription
+                            failed.selectedVariant = .original
+                            do { try store.update(failed) } catch { errorMessage = error.localizedDescription }
+                        }
                     }
                     errorMessage = error.localizedDescription
                 }
@@ -470,7 +489,7 @@ struct ContentView: View {
         guard !processing, camera.ready, !camera.permissionDenied else { return }
         processing = true
         pendingOptions = ScanProcessingOptions(automatic: automaticRecognition, dewarp: correctCurvature,
-                                               zone: pageZone, margin: safetyMargin)
+                                               zone: pageZone, margin: safetyMargin, mode: scanMode)
         camera.capture()
     }
 
@@ -481,6 +500,11 @@ struct ContentView: View {
 
     private func exportPDF() {
         guard !processing, !store.pages.isEmpty else { return }
+        guard store.pages.allSatisfy({ $0.status == .ready }) else {
+            errorMessage = "Controlla e conferma le pagine segnalate prima di esportare: nessun originale verrà inserito al posto del ritaglio senza la tua scelta."
+            showPages = true
+            return
+        }
         let urls = store.pages.compactMap { store.url(for: $0, variant: $0.selectedVariant) }
         guard urls.count == store.pages.count else { errorMessage = "Una pagina manca su disco: controlla la sessione."; return }
         processing = true

@@ -30,6 +30,22 @@ final class PageSegmentationService {
         return detect(cgImage: cg)
     }
 
+    func detectSpread(image: UIImage) -> ScanSpreadGeometry.Spread? {
+        guard let cg = ScanRaster.upright(image).cgImage else { return nil }
+        return spread(cgImage: cg)
+    }
+
+    func detectSpread(pixelBuffer: CVPixelBuffer) -> ScanSpreadGeometry.Spread? {
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cg = context.createCGImage(ci, from: ci.extent) else { return nil }
+        return spread(cgImage: cg)
+    }
+
+    private func spread(cgImage: CGImage) -> ScanSpreadGeometry.Spread? {
+        guard let raster = ScanRaster(cgImage: cgImage, maxDimension: 384) else { return nil }
+        return ScanSpreadGeometry.detect(rgba: raster.bytes, width: raster.width, height: raster.height)
+    }
+
     private func detect(cgImage: CGImage) -> PageSegmentationResult? {
         guard let raster = ScanRaster(cgImage: cgImage, maxDimension: 256),
               let surface = ScanGeometry.segment(rgba: raster.bytes, width: raster.width, height: raster.height) else { return nil }

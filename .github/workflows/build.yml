@@ -22,6 +22,12 @@ jobs:
           /tmp/bookscan-geometry
           swiftc ScanPDFExporter.swift Tests/PDFWriterTests.swift -o /tmp/bookscan-pdf
           /tmp/bookscan-pdf
+          swiftc CropCoordinates.swift Tests/Crop/main.swift -o /tmp/bookscan-crop
+          /tmp/bookscan-crop
+          swiftc ScanGeometry.swift ScanSpreadGeometry.swift Tests/Spread/main.swift -o /tmp/bookscan-spread
+          /tmp/bookscan-spread
+          swiftc ScanProcessingTypes.swift ScanSessionStore.swift Tests/StorageTests.swift -o /tmp/bookscan-storage
+          /tmp/bookscan-storage
 
       - name: Prepare iOS app icon from ICO
         run: |

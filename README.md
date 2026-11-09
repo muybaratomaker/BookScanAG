@@ -1,3 +1,5 @@
+> Aggiornamento: ritaglio verificabile e modalità **Libro aperto (2 pagine)**: [funzionamento, test e limiti](docs/BOOK-SPREAD.md). Il testo seguente descrive la versione storica 0.2.
+
 # BookScan AG — versione 0.2 (qualità bilanciata)
 
 App SwiftUI per iPhone, senza backend e senza OCR interno: acquisisce una foto del libro aperto, la separa in **due pagine** e crea un PDF da inviare a ChatGPT per la trascrizione.
