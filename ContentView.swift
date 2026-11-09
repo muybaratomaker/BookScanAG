@@ -3,8 +3,7 @@ import UIKit
 import CoreImage
 import AudioToolbox
 
-// BookScan AG 1.2.1: corrected Scanner filter preserving text contrast, single-page scan, reusable crop and document looks.
-// Compatible with existing CameraView.swift (CameraController / CameraPreview).
+@MainActor
 struct ContentView: View {
     @StateObject private var camera = CameraController()
     @State private var scanning = false
@@ -17,10 +16,14 @@ struct ContentView: View {
     @State private var exportedURL: URL?
     @State private var pdfSize: String?
 
-    // Store JPEGs of the cropped, unfiltered pages, so export styles remain reversible.
-    @State private var originals: [Data] = []
+    @StateObject private var store = ScanSessionStore()
+    @State private var pipeline = ScanProcessingPipeline()
+    @State private var automaticRecognition = true
+    @State private var correctCurvature = false
+    @State private var scanMode: ScanMode = .single
+    @State private var pendingOptions: ScanProcessingOptions?
     @State private var pageZone = CGRect(x: 0.075, y: 0.10, width: 0.85, height: 0.80)
-    @State private var safetyMargin = 0.07
+    @State private var safetyMargin = 0.03
     @State private var locked = false
     @State private var documentProfile: DocumentProfile = .compact
     @State private var scanStyle: ScanStyle = .scanner
@@ -34,6 +37,11 @@ struct ContentView: View {
             .toolbar(.hidden, for: .navigationBar)
             .background(scanning ? Color.black : Color(uiColor: .systemGroupedBackground))
             .onAppear { configureCamera() }
+            .onChange(of: scanMode) { mode in camera.setMode(mode, margin: safetyMargin) }
+            .onChange(of: safetyMargin) { margin in camera.setMode(scanMode, margin: margin) }
+            .onChange(of: automaticRecognition) { enabled in camera.setRecognitionEnabled(enabled) }
+            .onChange(of: store.errorMessage) { message in if let message { errorMessage = message } }
+            .onDisappear { camera.stop() }
             .onChange(of: scanning) { enabled in
                 if enabled { camera.start() } else { camera.stop() }
             }
@@ -44,7 +52,7 @@ struct ContentView: View {
             }
             .confirmationDialog("Eliminare tutte le pagine?", isPresented: $showClearConfirmation) {
                 Button("Elimina tutte", role: .destructive) {
-                    originals.removeAll()
+                    performStoreChange { try store.clear() }
                     pdfSize = nil
                 }
             } message: { Text("Questa operazione non si può annullare.") }
@@ -115,7 +123,7 @@ struct ContentView: View {
                         HStack(spacing: 12) {
                             Image(systemName: "camera.fill")
                                 .font(.system(size: 21, weight: .semibold))
-                            Text(originals.isEmpty ? "Inizia scansione" : "Continua scansione")
+                            Text(store.pages.isEmpty ? "Inizia scansione" : "Continua scansione")
                                 .font(.headline)
                             Spacer()
                             Image(systemName: "arrow.up.right")
@@ -138,7 +146,7 @@ struct ContentView: View {
                             .background(Color.blue.opacity(0.07), in: Circle())
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Sessione corrente").font(.headline)
-                            Text("\(originals.count) pagine" + (pdfSize.map { " · Ultimo PDF: \($0)" } ?? ""))
+                            Text("\(store.pages.count) pagine" + (pdfSize.map { " · Ultimo PDF: \($0)" } ?? ""))
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                         Spacer(minLength: 6)
@@ -147,7 +155,7 @@ struct ContentView: View {
                                 .font(.subheadline.weight(.semibold))
                                 .frame(width: 44, height: 44)
                         }
-                        .disabled(originals.isEmpty)
+                        .disabled(store.pages.isEmpty || processing)
                         .accessibilityLabel("Apri pagine acquisite")
                     }
                     .padding(.vertical, 20)
@@ -165,7 +173,7 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 20)
                     }
-                    if !originals.isEmpty {
+                    if !store.pages.isEmpty {
                         Button { exportPDF() } label: {
                             Label("Esporta PDF", systemImage: "square.and.arrow.up")
                                 .frame(maxWidth: .infinity).frame(height: 52)
@@ -194,7 +202,7 @@ struct ContentView: View {
                     Spacer()
                     VStack(spacing: 2) {
                         Text("BookScan").font(.headline.weight(.semibold))
-                        Text("\(originals.count) pagine acquisite")
+                        Text("\(store.pages.count) pagine acquisite")
                             .font(.caption).foregroundStyle(.white.opacity(0.64))
                     }
                     Spacer()
@@ -204,7 +212,7 @@ struct ContentView: View {
                             .frame(width: 48, height: 48)
                             .background(.white.opacity(0.13), in: Circle())
                     }
-                    .disabled(processing || originals.isEmpty)
+                    .disabled(processing || store.pages.isEmpty)
                     .accessibilityLabel("Esporta PDF")
                 }
                 .foregroundStyle(.white)
@@ -212,13 +220,25 @@ struct ContentView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 12)
 
+                Picker("Modalità scansione", selection: $scanMode) {
+                    ForEach(ScanMode.allCases) { mode in Text(mode.title).tag(mode) }
+                }.pickerStyle(.segmented).padding(.horizontal).disabled(processing)
+
                 GeometryReader { available in
-                    let displayWidth = min(available.size.width - 16, available.size.height * 0.75)
-                    let displayHeight = displayWidth * 4 / 3
+                    let aspect = max(0.1, camera.frameAspect)
+                    let displayWidth = min(available.size.width - 16, available.size.height * aspect)
+                    let displayHeight = displayWidth / aspect
                     ZStack(alignment: .bottom) {
                         ZStack {
                             CameraPreview(session: camera.session)
-                            CalibrationOverlay(zone: $pageZone, safety: safetyMargin, locked: locked)
+                            if automaticRecognition {
+                                ForEach(Array(camera.livePages.enumerated()), id: \.offset) { _, page in
+                                    ScanOverlayView(contour: page.points, uncertain: camera.liveUncertain)
+                                }
+                                ScanSeamOverlay(points: camera.liveSeam)
+                            } else {
+                                CalibrationOverlay(zone: $pageZone, safety: safetyMargin, locked: locked)
+                            }
                             if camera.permissionDenied {
                                 Color.black.opacity(0.85)
                                 Text("Abilita la fotocamera nelle Impostazioni")
@@ -230,7 +250,7 @@ struct ContentView: View {
                         .frame(width: displayWidth, height: displayHeight)
                         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
 
-                        Button { locked.toggle() } label: {
+                        Button { if automaticRecognition { automaticRecognition = false }; locked.toggle() } label: {
                             Label(locked ? "Ricalibra" : "Blocca ritaglio",
                                   systemImage: locked ? "lock.fill" : "hand.draw")
                                 .font(.footnote.weight(.semibold))
@@ -247,7 +267,7 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity)
 
                 HStack {
-                    Text(scanStyle.title)
+                    Text(processing ? "In elaborazione…" : camera.scanStatus)
                     Circle().frame(width: 3, height: 3)
                     Text("Margine \(Int(safetyMargin * 100))%")
                 }
@@ -276,24 +296,24 @@ struct ContentView: View {
                         .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(processing || camera.permissionDenied)
+                    .disabled(processing || camera.permissionDenied || !camera.ready)
                     .accessibilityLabel("Scatta pagina")
-                    .accessibilityHint("Aggiunge una pagina alla sessione")
+                    .accessibilityHint(scanMode == .book ? "Acquisisce due pagine, sinistra poi destra" : "Aggiunge una pagina alla sessione")
                     Spacer(minLength: 0)
                     Button { showPages = true } label: {
                         ZStack(alignment: .bottomTrailing) {
                             RoundedRectangle(cornerRadius: 16, style: .continuous)
                                 .fill(.white.opacity(0.12))
                                 .frame(width: 58, height: 58)
-                            if let last = originals.last, let image = UIImage(data: last) {
-                                Image(uiImage: image).resizable().scaledToFill()
+                            if let last = store.pages.last {
+                                ScanFileImage(url: store.thumbnailURL(for: last), maxPixelSize: 240).id(last.revision)
                                     .frame(width: 58, height: 58).clipped()
                                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                             } else {
                                 Image(systemName: "square.stack")
                                     .font(.title3).frame(width: 58, height: 58)
                             }
-                            Text("\(originals.count)")
+                            Text("\(store.pages.count)")
                                 .font(.caption2.bold()).foregroundStyle(.black)
                                 .padding(.horizontal, 6).padding(.vertical, 3)
                                 .background(.white, in: Capsule())
@@ -313,6 +333,15 @@ struct ContentView: View {
     private var controlsSheet: some View {
         NavigationStack {
             Form {
+                Section("Correzione intelligente") {
+                    Picker("Riconoscimento pagina", selection: $automaticRecognition) {
+                        Text("Automatico").tag(true)
+                        Text("Manuale").tag(false)
+                    }.pickerStyle(.segmented)
+                    Toggle("Correzione curvatura", isOn: $correctCurvature)
+                    Text("Gli originali sono conservati. Controlla i risultati in Pagine prima di esportare; puoi scegliere foto, ritaglio o correzione.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Section("Qualità PDF") {
                     Picker("Qualità", selection: $documentProfile) {
                         ForEach(DocumentProfile.allCases) { p in Text(p.title).tag(p) }
@@ -333,7 +362,7 @@ struct ContentView: View {
                         Text("\(Int(safetyMargin * 100))%")
                             .foregroundStyle(.secondary)
                     }
-                    Slider(value: $safetyMargin, in: 0.03...0.12, step: 0.01)
+                    Slider(value: $safetyMargin, in: 0.01...0.08, step: 0.01)
                         .disabled(locked)
                     Button(locked ? "Sblocca calibrazione" : "Blocca calibrazione") {
                         locked.toggle()
@@ -344,15 +373,15 @@ struct ContentView: View {
                     }
                 }
                 Section("Pagine") {
-                    Button("Visualizza \(originals.count) pagine") { showControls = false; showPages = true }
-                        .disabled(originals.isEmpty)
+                    Button("Visualizza \(store.pages.count) pagine") { showControls = false; showPages = true }
+                        .disabled(store.pages.isEmpty || processing)
                     Button("Elimina ultima pagina", role: .destructive) {
-                        if !originals.isEmpty { originals.removeLast() }
-                    }.disabled(originals.isEmpty)
+                        performStoreChange { try store.removeLast() }
+                    }.disabled(store.pages.isEmpty || processing)
                     Button("Cancella sessione", role: .destructive) {
                         showControls = false
                         showClearConfirmation = true
-                    }.disabled(originals.isEmpty)
+                    }.disabled(store.pages.isEmpty || processing)
                 }
             }
             .navigationTitle("Controlli")
@@ -368,16 +397,20 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                    ForEach(originals.indices, id: \.self) { i in
-                        VStack(spacing: 6) {
-                            if let image = UIImage(data: originals[i]) {
-                                Image(uiImage: image).resizable().scaledToFit()
+                    ForEach(Array(store.pages.enumerated()), id: \.element.id) { index, page in
+                        NavigationLink {
+                            ScanReviewView(store: store, pageID: page.id, pipeline: pipeline, processing: $processing)
+                        } label: {
+                            VStack(spacing: 6) {
+                                ScanFileImage(url: store.thumbnailURL(for: page), maxPixelSize: 240).id(page.revision)
                                     .frame(maxWidth: .infinity).frame(height: 200)
                                     .background(Color(uiColor: .secondarySystemBackground))
                                     .clipShape(RoundedRectangle(cornerRadius: 12))
+                                Text("Pagina \(index + 1)").font(.caption.weight(.medium))
+                                Text(page.status.title).font(.caption2)
+                                    .foregroundStyle(page.status == .review || page.status == .failed ? Color.orange : Color.secondary)
                             }
-                            Text("Pagina \(i+1)").font(.caption.weight(.medium))
-                        }
+                        }.disabled(processing)
                     }
                 }.padding()
             }
@@ -388,110 +421,110 @@ struct ContentView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Esporta") { showPages = false; exportPDF() }
-                        .disabled(originals.isEmpty || processing)
+                        .disabled(store.pages.isEmpty || processing)
                 }
                 ToolbarItem(placement: .bottomBar) {
                     Button("Elimina ultima", role: .destructive) {
-                        if !originals.isEmpty { originals.removeLast() }
-                    }.disabled(originals.isEmpty)
+                        performStoreChange { try store.removeLast() }
+                    }.disabled(store.pages.isEmpty || processing)
                 }
             }
         }
     }
 
     private func configureCamera() {
-        camera.onPhoto = { image in
-            let zone = pageZone
-            let margin = safetyMargin
-            DispatchQueue.global(qos: .userInitiated).async {
-                let result = FixedCrop.cropOriginal(image, zone: zone, margin: margin)
-                DispatchQueue.main.async {
-                    processing = false
-                    if let result {
-                        originals.append(result)
-                        AudioServicesPlaySystemSound(1104)
-                    } else {
-                        errorMessage = "Ritaglio non riuscito. Riprova lo scatto."
+        camera.setRecognitionEnabled(automaticRecognition)
+        camera.setMode(scanMode, margin: safetyMargin)
+        camera.onError = { message in processing = false; pendingOptions = nil; errorMessage = message }
+        camera.onPhoto = { data in
+            let options = pendingOptions ?? ScanProcessingOptions(automatic: automaticRecognition, dewarp: correctCurvature, zone: pageZone, margin: safetyMargin, mode: scanMode)
+            pendingOptions = nil
+            Task { @MainActor in
+                var acquired: ScanPage?
+                defer { processing = false }
+                do {
+                    var page = try await store.addOriginal(data)
+                    acquired = page
+                    page.status = .processing
+                    try store.update(page)
+                    guard let url = store.url(for: page, variant: .original) else { throw ScanProcessingError.unreadable }
+                    let capture = try await pipeline.processCapture(originalURL: url, options: options)
+                    var targets = [page]
+                    if capture.pages.count == 2 {
+                        let right = try await store.addSibling(of: page)
+                        targets = [store.pages.first(where: { $0.id == page.id }) ?? page, right]
                     }
+                    for (index, result) in capture.pages.enumerated() {
+                        var target = targets[index]
+                        if options.mode == .book {
+                            target.captureID = page.id
+                            target.spreadSide = capture.pages.count == 2 ? (index == 0 ? "left" : "right") : "pending"
+                            target.spreadSeam = capture.seam
+                            target.spreadBounds = capture.bounds
+                        }
+                        try store.update(target)
+                        _ = try await store.applyProcessed(result, to: target)
+                    }
+                    pdfSize = nil
+                    AudioServicesPlaySystemSound(1104)
+                } catch {
+                    if let acquired {
+                        for var failed in store.pages where (failed.id == acquired.id || failed.captureID == acquired.id)
+                            && (failed.status == .processing || failed.status == .acquired) {
+                            failed.status = .failed
+                            failed.message = error.localizedDescription
+                            failed.selectedVariant = .original
+                            do { try store.update(failed) } catch { errorMessage = error.localizedDescription }
+                        }
+                    }
+                    errorMessage = error.localizedDescription
                 }
             }
         }
+        if let message = store.errorMessage { errorMessage = message }
         if scanning { camera.start() }
     }
 
     private func takePhoto() {
-        guard !processing, !camera.permissionDenied else { return }
+        guard !processing, camera.ready, !camera.permissionDenied else { return }
         processing = true
+        pendingOptions = ScanProcessingOptions(automatic: automaticRecognition, dewarp: correctCurvature,
+                                               zone: pageZone, margin: safetyMargin, mode: scanMode)
         camera.capture()
-        // Photo callback is responsible for resetting the processing state.
+    }
+
+    private func performStoreChange(_ operation: () throws -> Void) {
+        do { try operation(); pdfSize = nil }
+        catch { errorMessage = error.localizedDescription }
     }
 
     private func exportPDF() {
-        guard !processing, !originals.isEmpty else { return }
+        guard !processing, !store.pages.isEmpty else { return }
+        guard store.pages.allSatisfy({ $0.status == .ready }) else {
+            errorMessage = "Controlla e conferma le pagine segnalate prima di esportare: nessun originale verrà inserito al posto del ritaglio senza la tua scelta."
+            showPages = true
+            return
+        }
+        let urls = store.pages.compactMap { store.url(for: $0, variant: $0.selectedVariant) }
+        guard urls.count == store.pages.count else { errorMessage = "Una pagina manca su disco: controlla la sessione."; return }
         processing = true
-        let inputPages = originals
-        let profile = documentProfile
-        let style = scanStyle
-        DispatchQueue.global(qos: .userInitiated).async {
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("BookScan-\(UUID().uuidString).pdf")
-            let pageBounds = CGRect(x: 0, y: 0, width: 595, height: 842)
+        let profile = documentProfile, style = scanStyle
+        Task { @MainActor in
+            defer { processing = false }
             do {
-                try UIGraphicsPDFRenderer(bounds: pageBounds).writePDF(to: url) { pdf in
-                    for data in inputPages {
-                        guard let converted = DocumentRendering.render(data, profile: profile, style: style),
-                              let image = UIImage(data: converted) else { continue }
-                        pdf.beginPage()
-                        let area = pageBounds.insetBy(dx: 16, dy: 16)
-                        let factor = min(area.width / image.size.width,
-                                         area.height / image.size.height)
-                        let size = CGSize(width: image.size.width * factor,
-                                          height: image.size.height * factor)
-                        let frame = CGRect(x: (pageBounds.width - size.width) / 2,
-                                           y: (pageBounds.height - size.height) / 2,
-                                           width: size.width, height: size.height)
-                        image.draw(in: frame)
-                    }
-                }
-                let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                DispatchQueue.main.async {
-                    processing = false
-                    exportedURL = url
-                    pdfSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
-                    showShare = true
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    processing = false
-                    errorMessage = "Errore PDF: \(error.localizedDescription)"
-                }
-            }
+                let url = try await Task.detached(priority: .userInitiated) {
+                    try ScanPDFExporter.export(pages: urls, profile: profile, style: style)
+                }.value
+                let bytes = (try url.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
+                exportedURL = url
+                pdfSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+                showShare = true
+            } catch { errorMessage = "Errore PDF: \(error.localizedDescription)" }
         }
     }
 }
 
-private enum ScanStyle: String, CaseIterable, Identifiable {
-    case natural, optimized, scanner, blackWhite
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .natural: return "Naturale"
-        case .optimized: return "Ottimizzato"
-        case .scanner: return "Scanner"
-        case .blackWhite: return "Bianco e nero"
-        }
-    }
-    var description: String {
-        switch self {
-        case .natural: return "Grigi naturali, contrasto delicato."
-        case .optimized: return "Sfondo più chiaro e testo ben contrastato."
-        case .scanner: return "Bianco uniforme e ombre attenuate: ideale per pagine di libri."
-        case .blackWhite: return "Contrasto forte; verifica i caratteri sottili prima di esportare."
-        }
-    }
-}
-
-private struct CalibrationOverlay: View {
+struct CalibrationOverlay: View {
     @Binding var zone: CGRect
     let safety: Double
     let locked: Bool
@@ -575,115 +608,6 @@ private struct ZoneDrag: ViewModifier {
                 }
             }
             .onEnded { _ in origin = nil })
-    }
-}
-
-private enum DocumentProfile: String, CaseIterable, Identifiable {
-    case compact
-    case readable
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .compact: return "Documento leggero"
-        case .readable: return "Testo piccolo"
-        }
-    }
-    var longEdge: Int { self == .compact ? 1500 : 1700 }
-    var jpegQuality: CGFloat { self == .compact ? 0.54 : 0.68 }
-    var contrast: CGFloat { self == .compact ? 1.14 : 1.09 }
-    var brightness: CGFloat { self == .compact ? 0.025 : 0.01 }
-}
-
-
-private enum FixedCrop {
-    static func expanded(_ rect: CGRect, margin: Double) -> CGRect {
-        let padX = rect.width * margin
-        let padY = rect.height * margin
-        return rect.insetBy(dx: -padX, dy: -padY)
-            .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-    }
-
-    static func cropOriginal(_ image: UIImage, zone: CGRect, margin: Double) -> Data? {
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        let upright = UIGraphicsImageRenderer(size: image.size, format: format)
-            .image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
-        guard let cg = upright.cgImage else { return nil }
-        let safe = expanded(zone, margin: margin)
-        let bounds = CGRect(x: safe.minX * CGFloat(cg.width),
-                            y: safe.minY * CGFloat(cg.height),
-                            width: safe.width * CGFloat(cg.width),
-                            height: safe.height * CGFloat(cg.height)).integral
-            .intersection(CGRect(x: 0, y: 0, width: CGFloat(cg.width), height: CGFloat(cg.height)))
-        guard !bounds.isEmpty, let cropped = cg.cropping(to: bounds) else { return nil }
-        // Working copy: retain details for all filter choices without full-resolution memory cost.
-        let page = UIImage(cgImage: cropped)
-        let factor = min(1, 2000 / max(page.size.width, page.size.height))
-        let target = CGSize(width: max(1, (page.size.width * factor).rounded()),
-                            height: max(1, (page.size.height * factor).rounded()))
-        let scaled = UIGraphicsImageRenderer(size: target, format: format)
-            .image { _ in page.draw(in: CGRect(origin: .zero, size: target)) }
-        return scaled.jpegData(compressionQuality: 0.86)
-    }
-}
-
-private enum DocumentRendering {
-    // The image is processed ONLY at PDF export. Original cropped JPEGs are kept
-    // untouched so users can re-export using a different look.
-    static func render(_ jpeg: Data, profile: DocumentProfile, style: ScanStyle) -> Data? {
-        guard let image = UIImage(data: jpeg), let cg = image.cgImage else { return nil }
-        var ci = CIImage(cgImage: cg)
-        ci = ci.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: 0
-        ])
-
-        switch style {
-        case .natural:
-            ci = ci.applyingFilter("CIColorControls", parameters: [
-                kCIInputContrastKey: 1.06,
-                kCIInputBrightnessKey: 0.008
-            ])
-        case .optimized:
-            ci = ci.applyingFilter("CIColorControls", parameters: [
-                kCIInputContrastKey: 1.16,
-                kCIInputBrightnessKey: 0.035
-            ])
-            ci = ci.applyingFilter("CISharpenLuminance", parameters: [
-                kCIInputSharpnessKey: 0.25
-            ])
-        case .scanner:
-            // Safe scan look: retain dark letter strokes while lifting light paper.
-            // IMPORTANT: Do not divide the photo by a blurred background here:
-            // that previously normalized dark strokes almost to white.
-            ci = ci.applyingFilter("CIColorControls", parameters: [
-                kCIInputSaturationKey: 0,
-                kCIInputContrastKey: 1.30,
-                kCIInputBrightnessKey: 0.025
-            ])
-            ci = ci.applyingFilter("CISharpenLuminance", parameters: [
-                kCIInputSharpnessKey: 0.22
-            ])
-        case .blackWhite:
-            ci = ci.applyingFilter("CIColorControls", parameters: [
-                kCIInputContrastKey: 1.65,
-                kCIInputBrightnessKey: 0.06
-            ])
-            ci = ci.applyingFilter("CISharpenLuminance", parameters: [
-                kCIInputSharpnessKey: 0.35
-            ])
-        }
-
-        let context = CIContext()
-        guard let output = context.createCGImage(ci, from: ci.extent) else { return nil }
-        let page = UIImage(cgImage: output)
-        let factor = min(1, CGFloat(profile.longEdge) / max(page.size.width, page.size.height))
-        let target = CGSize(width: max(1, (page.size.width * factor).rounded()),
-                            height: max(1, (page.size.height * factor).rounded()))
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        let resized = UIGraphicsImageRenderer(size: target, format: format)
-            .image { _ in page.draw(in: CGRect(origin: .zero, size: target)) }
-        return resized.jpegData(compressionQuality: profile.jpegQuality)
     }
 }
 

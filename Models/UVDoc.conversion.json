@@ -1,0 +1,28 @@
+{
+  "upstream": "https://github.com/tanguymagne/UVDoc",
+  "commit": "4c9b82b537057aff2526e6dd118a847cdd072e82",
+  "checkpoint_sha256": "7e90861b8a516eb4bc51f84bd889cb77275743d2d1d3ca8091951ec9f2b7da23",
+  "checkpoint_bytes": 32158393,
+  "model_bytes": 31636963,
+  "input": [
+    1,
+    3,
+    712,
+    488
+  ],
+  "output": [
+    1,
+    2,
+    45,
+    31
+  ],
+  "torchscript_max_absolute_difference": 0.0,
+  "reference_grid_min": -0.9423859715461731,
+  "reference_grid_max": 0.9574815630912781,
+  "inference_and_tracing_seconds_linux_cpu": 0.9790208699999994,
+  "coreml_runtime_comparison": "NOT RUN: requires macOS or iOS",
+  "reference_kind": "synthetic curved lines, not real book photo",
+  "torch": "2.5.1+cpu",
+  "coremltools": "8.3.0",
+  "precision": "FLOAT32"
+}
